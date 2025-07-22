@@ -19,7 +19,7 @@
 #define omp_get_max_threads() 1
 #endif
 
-namespace pgm::internal {
+namespace hyperpgm::internal {
 
     template<typename T>
     using LargeSigned = typename std::conditional_t<std::is_floating_point_v<T>,
