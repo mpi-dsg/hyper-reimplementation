@@ -633,7 +633,7 @@ std::vector<Hyper::PLASegment> Hyper::buildPlaSegments(
     KeyType maxKey = data.back().first;
 
     // Use PLA segmentation to create linear segments
-    pgm::internal::make_segmentation_par(
+    hyperpgm::internal::make_segmentation_par(
             data.size(),
             static_cast<size_t>(delta_),
             [&](auto i) { return data[i].first; },
