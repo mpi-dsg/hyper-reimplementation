@@ -358,7 +358,7 @@ std::vector<std::pair<KeyType, void*>> LeafNode::performSplit(
     std::vector<Hyper::PLASegment> segments;
     KeyType maxKey = data.back().first;
 
-    pgm::internal::make_segmentation_par(
+    hyperpgm::internal::make_segmentation_par(
             data.size(),
             static_cast<size_t>(delta),
             [&](size_t i) { return data[i].first; },
