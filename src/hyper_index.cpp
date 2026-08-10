@@ -977,14 +977,15 @@ void Hyper::convertSearchNodeToModelNode(SearchInnerNode* sNode, void* parentNod
         searchNodeKey = slot.KeyChildPtr.first;
     }
 
-    // Collect all data
+    // Collect all data (must pass a tagged pointer — collectAllData dispatches on tag bits)
     std::vector<std::pair<KeyType, ValueType>> subtreeData;
-
-   collectAllData(sNode, subtreeData);
+    collectAllData(taggedSearchNode, subtreeData);
 
     // Build new leaves from leaf data
-    std::vector<std::pair<KeyType, void*>> newLeaves;
-    newLeaves = buildLeaves(std::move(subtreeData));
+    std::vector<std::pair<KeyType, void*>> newLeaves = buildLeaves(std::move(subtreeData));
+    if (newLeaves.empty()) {
+        return;
+    }
 
     // Extract boundary keys for configuration search
     std::vector<KeyType> newBoundaryKeys;
