@@ -334,87 +334,74 @@ void ModelInnerNode::bulkSetChild(KeyType key, void* child) {
 
 void ModelInnerNode::bulkLoad(std::vector<std::pair<KeyType, void*>>& leaves,
                               std::vector<int>& slot_counts, double lambda) {
-    // Initialize active slots array
-    std::vector<int> act_slots(MR_ + 1, 0);
-
-    // Count predicted slots for all leaves
-    for (auto & leave : leaves) {
-        auto pos = predictSlot(leave.first);
-        act_slots[pos]++;
-    }
-
-    // Calculate cumulative sums for slot indices
     std::vector<int> sums(slot_counts.size());
     std::partial_sum(slot_counts.begin(), slot_counts.end(), sums.begin());
 
-    // Reset leaf node counts
     leaf_node_count_.store(0, std::memory_order_relaxed);
     initial_leaf_node_count_.store(0, std::memory_order_relaxed);
 
-    // Process each slot with its corresponding leaves
-    for (int i = 0; i < slot_counts.size(); ++i) {
-        // Skip empty slots
-        if (slot_counts[i] == 0) {
+    const size_t half = leaves.size() / 2;
+
+    auto build_group = [&](std::vector<std::pair<KeyType, void*>>& group) -> void* {
+        if (group.size() == 1) return group.front().second;
+        if (group.size() <= 8) {
+            auto* search_node = new SearchInnerNode();
+            search_node->bulk_load(group);
+            return tagPointer(search_node, NodeType::SearchInner);
+        }
+        std::vector<KeyType> keys;
+        keys.reserve(group.size());
+        for (const auto& p : group) keys.push_back(p.first);
+        ConfigurationSearch cs(keys, lambda);
+        auto config = cs.search();
+        auto* model = new ModelInnerNode(config.best_slope, keys.front(), config.best_mr);
+        model->bulkLoad(group, config.best_slot_counts, lambda);
+        return tagPointer(model, NodeType::ModelInner);
+    };
+
+    for (size_t i = 0; i < slot_counts.size(); ++i) {
+        if (slot_counts[i] == 0) continue;
+
+        const size_t start = (i == 0) ? 0 : static_cast<size_t>(sums[i - 1]);
+        const size_t end = static_cast<size_t>(sums[i]);
+        const size_t group_n = end - start;
+        KeyType slot_key = leaves[start].first;
+        KeyType right_key = (group_n > 1) ? leaves[start + group_n / 2].first : slot_key;
+
+        std::vector<std::pair<KeyType, void*>> sliced_leaves(
+                std::make_move_iterator(leaves.begin() + static_cast<long>(start)),
+                std::make_move_iterator(leaves.begin() + static_cast<long>(end)));
+
+        // Paper §3.2: rebalance if one slot holds more than half the keys.
+        if (group_n > half && group_n > 1) {
+            size_t mid = group_n / 2;
+            std::vector<std::pair<KeyType, void*>> left(
+                std::make_move_iterator(sliced_leaves.begin()),
+                std::make_move_iterator(sliced_leaves.begin() + static_cast<long>(mid)));
+            std::vector<std::pair<KeyType, void*>> right(
+                std::make_move_iterator(sliced_leaves.begin() + static_cast<long>(mid)),
+                std::make_move_iterator(sliced_leaves.end()));
+            void* left_child = build_group(left);
+            void* right_child = build_group(right);
+            auto* bal = new SearchInnerNode();
+            std::vector<std::pair<KeyType, void*>> two = {
+                {slot_key, left_child},
+                {right_key, right_child}
+            };
+            bal->bulk_load(two);
+            bulkSetChild(slot_key, tagPointer(bal, NodeType::SearchInner));
             continue;
         }
 
-        // Determine the range of leaves for this slot
-        const size_t start = (i == 0) ? 0 : sums[i-1];
-        const size_t end = sums[i];
-        KeyType slot_key = leaves[start].first;
-
-        if (slot_counts[i] == 1) {
-            // Only one leaf assigned to this slot - direct mapping
-            bulkSetChild(slot_key, leaves[start].second);
-        } else if (slot_counts[i] <= 8) {
-            // Small number of leaves - use a search inner node
-            auto* search_node = new SearchInnerNode();
-
-            // Extract leaves for this slot
-            std::vector<std::pair<KeyType, void*>> sliced_leaves(
-                    std::make_move_iterator(leaves.begin() + start),
-                    std::make_move_iterator(leaves.begin() + end)
-            );
-
-            // Bulk load the search inner node
-            search_node->bulk_load(sliced_leaves);
-            void* taggedSearch = tagPointer(search_node, NodeType::SearchInner);
-            bulkSetChild(slot_key, taggedSearch);
+        if (group_n == 1) {
+            bulkSetChild(slot_key, sliced_leaves.front().second);
         } else {
-            // Large number of leaves - create another model inner node
-
-            // Extract keys for configuration search
-            std::vector<KeyType> keys;
-            keys.reserve(end - start);
-            std::transform(leaves.begin() + start, leaves.begin() + end,
-                           std::back_inserter(keys),
-                           [](const std::pair<KeyType, void*>& p) { return p.first; });
-
-            // Find optimal configuration for this subset
-            ConfigurationSearch cs(keys, lambda);
-            auto config = cs.search();
-
-            // Create new model inner node
-            auto* model_child_node = new ModelInnerNode(
-                    config.best_slope,
-                    keys.front(),
-                    config.best_mr
-            );
-
-            // Extract leaves for this model node
-            std::vector<std::pair<KeyType, void*>> sliced_leaves(
-                    std::make_move_iterator(leaves.begin() + start),
-                    std::make_move_iterator(leaves.begin() + end)
-            );
-
-            // Recursively insert into the new model node
-            model_child_node->bulkLoad(sliced_leaves, config.best_slot_counts, lambda);
-            void* taggedModel = tagPointer(model_child_node, NodeType::ModelInner);
-            bulkSetChild(slot_key, taggedModel);
+            bulkSetChild(slot_key, build_group(sliced_leaves));
         }
     }
 
-    initial_leaf_node_count_.store(leaf_node_count_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    initial_leaf_node_count_.store(leaf_node_count_.load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
 }
 
 void ModelInnerNode::bulkDuplicateToRight(size_t from) {
@@ -579,7 +566,8 @@ size_t ModelInnerNode::getLeafNodeCount() const {
 bool ModelInnerNode::shouldRebuild() const {
     size_t curr = leaf_node_count_.load(std::memory_order_relaxed);
     size_t init = initial_leaf_node_count_.load(std::memory_order_relaxed);
-    return init > 0 && curr >= 10 * init;
+    // Paper §3.3.2: rebuild M-inner when leaf count doubles.
+    return init > 0 && curr >= 2 * init;
 }
 
 void ModelInnerNode::deleteChildNode(void* childPtr) {

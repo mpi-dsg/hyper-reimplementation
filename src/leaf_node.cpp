@@ -1,4 +1,6 @@
 #include <iostream>
+#include <cmath>
+#include <algorithm>
 #include "../include/leaf_node.h"
 #include "../include/epoch_manager.h"
 
@@ -45,28 +47,30 @@ void LeafNode::Slot::setSingle(KeyType k, ValueType v) {
 void LeafNode::Slot::setOverflow(KeyType k, ValueType v) {
     OverflowBuffer* current = data.overflowPtr.load(std::memory_order_acquire);
     if (!current) {
-        OverflowBuffer* newBuffer = new OverflowBuffer(4);  // Initial capacity of 4
+        OverflowBuffer* newBuffer = new OverflowBuffer(4);
         newBuffer->bulk_load({{k, v}});
         data.overflowPtr.store(newBuffer, std::memory_order_release);
-    } else {
-        // RCU: Create new buffer with inserted element
-        OverflowBuffer* newBuffer = current->insertRCU(k, v);
-        data.overflowPtr.store(newBuffer, std::memory_order_release);
-        // Schedule old buffer for safe deletion
-        safeDelete(current);
+        return;
     }
+    if (!isHyperLockingEnabled()) {
+        current->insert(k, v);
+        return;
+    }
+    OverflowBuffer* newBuffer = current->insertRCU(k, v);
+    data.overflowPtr.store(newBuffer, std::memory_order_release);
+    safeDelete(current);
 }
 
 // --- LeafNode implementation ---
 LeafNode::LeafNode(double slope, KeyType minKey, KeyType maxKey)
         : slope_(slope), minKey_(minKey), maxPossibleKey_(std::numeric_limits<KeyType>::max()),
           MR_(ceil(slope * static_cast<double>(maxKey - minKey))), slots_(MR_+1),
-          init_histogram_(MR_+1, 0), op_counter_(0) {}
+          op_counter_(0), init_histogram_(MR_+1, 0) {}
 
 LeafNode::LeafNode(const LeafNode& other)
         : slope_(other.slope_), minKey_(other.minKey_), maxPossibleKey_(other.maxPossibleKey_),
-          MR_(other.MR_), slots_(other.MR_ + 1), init_histogram_(other.init_histogram_),
-          op_counter_(other.op_counter_.load()) {
+          MR_(other.MR_), slots_(other.MR_ + 1),
+          op_counter_(other.op_counter_.load()), init_histogram_(other.init_histogram_) {
 
     // Deep copy all slots (locks are initialized fresh)
     for (size_t i = 0; i < other.slots_.size(); ++i) {
@@ -92,84 +96,146 @@ LeafNode::~LeafNode() {
     }
 }
 
+size_t LeafNode::slotConflictCount(size_t idx) const {
+    if (idx >= slots_.size()) return 0;
+    const auto& s = slots_[idx];
+    if (s.isKV()) return 1;
+    if (s.isPointer()) {
+        OverflowBuffer* buffer = s.data.overflowPtr.load(std::memory_order_acquire);
+        return buffer ? buffer->size() : 0;
+    }
+    return 0;
+}
+
+size_t LeafNode::maxConflictCount() const {
+    size_t peak = 0;
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        peak = std::max(peak, slotConflictCount(i));
+    }
+    return peak;
+}
+
+void LeafNode::overflowInsert(Slot& slot, KeyType key, ValueType value) {
+    OverflowBuffer* current = slot.data.overflowPtr.load(std::memory_order_acquire);
+    if (!current) {
+        OverflowBuffer* neu = new OverflowBuffer(4);
+        neu->bulk_load({{key, value}});
+        slot.data.overflowPtr.store(neu, std::memory_order_release);
+        return;
+    }
+    if (!isHyperLockingEnabled()) {
+        current->insert(key, value);
+        return;
+    }
+    OverflowBuffer* neu = current->insertRCU(key, value);
+    slot.data.overflowPtr.store(neu, std::memory_order_release);
+    safeDelete(current);
+}
+
+bool LeafNode::overflowErase(Slot& slot, KeyType key) {
+    OverflowBuffer* current = slot.data.overflowPtr.load(std::memory_order_acquire);
+    if (!current) return false;
+
+    if (!isHyperLockingEnabled()) {
+        if (!current->erase(key)) return false;
+        if (current->size() == 0) {
+            delete current;
+            slot.data.overflowPtr.store(nullptr, std::memory_order_release);
+            slot.data.kv.key.store(0, std::memory_order_release);
+            slot.data.kv.value = 0;
+        } else if (current->size() == 1) {
+            auto only = current->data().front();
+            delete current;
+            slot.data.overflowPtr.store(nullptr, std::memory_order_release);
+            slot.setSingle(only.first, only.second);
+        }
+        return true;
+    }
+
+    OverflowBuffer* neu = current->eraseRCU(key);
+    if (!neu) return false;
+    if (neu->size() == 0) {
+        delete neu;
+        slot.data.overflowPtr.store(nullptr, std::memory_order_release);
+        slot.data.kv.key.store(0, std::memory_order_release);
+        slot.data.kv.value = 0;
+    } else if (neu->size() == 1) {
+        auto only = neu->data().front();
+        delete neu;
+        slot.data.overflowPtr.store(nullptr, std::memory_order_release);
+        slot.setSingle(only.first, only.second);
+    } else {
+        slot.data.overflowPtr.store(neu, std::memory_order_release);
+    }
+    safeDelete(current);
+    return true;
+}
+
 InsertReturn LeafNode::insert(
         KeyType key,
         ValueType value,
         double delta) {
 
-    // Check if key exceeds maximum possible key for this leaf
     if (key >= maxPossibleKey_) {
-        // Return retry signal instead of throwing exception
         return InsertReturn(InsertResult::RetryFromRoot);
     }
 
-    // Predict the slot for the key
     size_t idx = predictSlot(key);
     bool needsSplit = false;
 
-    // Lock only the specific slot we're inserting into (skipped if ST mode).
     std::unique_lock<std::mutex> slotLock(slots_[idx].lock, std::defer_lock);
     if (isHyperLockingEnabled()) {
         slotLock.lock();
     }
     auto& slot = slots_[idx];
 
-    // Handle different scenarios based on slot state
     if (slot.isEmpty()) {
-        // Empty slot - simply insert the key-value pair
         slot.setSingle(key, value);
     } else if (slot.isKV()) {
-        // Slot contains a key-value pair - convert to overflow buffer
         KeyType existingKey = decodeKey(slot.data.kv.key.load(std::memory_order_acquire));
         ValueType existingValue = slot.data.kv.value;
-
-        auto p0 = std::make_pair(existingKey, existingValue);
-        auto p1 = std::make_pair(key, value);
-
-        if (p1.first < p0.first) {
-            std::swap(p0, p1);
+        if (existingKey == key) {
+            slot.data.kv.value = value;
+        } else {
+            auto p0 = std::make_pair(existingKey, existingValue);
+            auto p1 = std::make_pair(key, value);
+            if (p1.first < p0.first) std::swap(p0, p1);
+            // Clear KV tag before storing overflow pointer (union aliasing).
+            slot.data.kv.key.store(0, std::memory_order_relaxed);
+            OverflowBuffer* newBuffer = new OverflowBuffer(4);
+            newBuffer->bulk_load({p0, p1});
+            slot.data.overflowPtr.store(newBuffer, std::memory_order_release);
         }
-
-        // Create new overflow buffer with both elements
-        OverflowBuffer* newBuffer = new OverflowBuffer(4);
-        newBuffer->bulk_load({p0, p1});
-
-        // Atomically update the slot to point to overflow buffer
-        slot.data.overflowPtr.store(newBuffer, std::memory_order_release);
     } else {
-        // Slot contains an overflow buffer - add the new pair using RCU
-        OverflowBuffer* current = slot.data.overflowPtr.load(std::memory_order_acquire);
-        OverflowBuffer* newBuffer = current->insertRCU(key, value);
-        slot.data.overflowPtr.store(newBuffer, std::memory_order_release);
-        
-        // Schedule old buffer for safe deletion
-        safeDelete(current);
-
-        // Trigger segmentation if overflow buffer becomes too large
-        if (newBuffer->size() > (2 * delta + 1)) {
-            needsSplit = true;
-        }
+        overflowInsert(slot, key, value);
     }
 
-    // Release the slot lock before checking for split (no-op if locks disabled).
+    size_t conflicts = slotConflictCount(idx);
+    // Policy 1: C^max_leaf, and Corollary 3.1 overflow bound.
+    if (conflicts >= kMaxLeafConflicts || conflicts > static_cast<size_t>(2 * delta + 1)) {
+        needsSplit = true;
+    }
+
     if (slotLock.owns_lock()) {
         slotLock.unlock();
     }
 
-    // Increment operation counter
-    op_counter_.fetch_add(1, std::memory_order_relaxed);
-
-    if (!needsSplit) {
-        return InsertReturn(InsertResult::Success);  // No restructuring needed
+    // Policy 2: check KS divergence when the 16-bit op counter wraps.
+    uint16_t prev = op_counter_.fetch_add(1, std::memory_order_relaxed);
+    if (static_cast<uint16_t>(prev + 1) == 0 && checkPolicyTwo()) {
+        needsSplit = true;
     }
 
-    // Check if we need to perform split with parent lock
+    if (!needsSplit) {
+        return InsertReturn(InsertResult::Success);
+    }
+
     auto splitResult = performSplitWithParentLock(delta);
     if (splitResult.has_value()) {
         return InsertReturn(InsertResult::SuccessWithSplit, std::move(*splitResult));
     }
 
-    return InsertReturn(InsertResult::Success);  // Split was attempted but not completed
+    return InsertReturn(InsertResult::Success);
 }
 
 std::optional<ValueType> LeafNode::find(KeyType key) const {
@@ -205,12 +271,9 @@ std::optional<ValueType> LeafNode::find(KeyType key) const {
 bool LeafNode::erase(KeyType key) {
     size_t idx = predictSlot(key);
     auto& slot = slots_[idx];
-
-    // Lock the specific slot for erase operation (no-op if locking disabled).
     MaybeLock slotLock(slot.lock);
 
     // Paper §4.4: deleting the leftmost key must not change minKey_ metadata.
-    // minKey_ is intentionally left untouched below.
 
     if (!slot.isPointer() && slot.isKV()) {
         KeyType original_key = decodeKey(slot.data.kv.key.load(std::memory_order_acquire));
@@ -219,31 +282,36 @@ bool LeafNode::erase(KeyType key) {
             return true;
         }
         return false;
-    } else if (slot.isPointer()) {
-        OverflowBuffer* current = slot.data.overflowPtr.load(std::memory_order_acquire);
-        if (current) {
-            OverflowBuffer* newBuffer = current->eraseRCU(key);
-            if (newBuffer) {
-                if (newBuffer->size() == 0) {
-                    // Empty overflow → clear slot
-                    delete newBuffer;
-                    slot.data.overflowPtr.store(nullptr, std::memory_order_release);
-                    slot.data.kv.key.store(0, std::memory_order_release);
-                    slot.data.kv.value = 0;
-                } else if (newBuffer->size() == 1) {
-                    // Collapse singleton overflow back to an accurate slot
-                    auto only = newBuffer->data().front();
-                    delete newBuffer;
-                    slot.data.overflowPtr.store(nullptr, std::memory_order_release);
-                    slot.setSingle(only.first, only.second);
-                } else {
-                    slot.data.overflowPtr.store(newBuffer, std::memory_order_release);
-                }
-                // Schedule old buffer for safe deletion
-                safeDelete(current);
-                return true;
-            }
+    }
+    if (slot.isPointer()) {
+        return overflowErase(slot, key);
+    }
+    return false;
+}
+
+bool LeafNode::update(KeyType key, ValueType value) {
+    if (key > maxPossibleKey_) return false;
+    size_t idx = predictSlot(key);
+    auto& slot = slots_[idx];
+    MaybeLock slotLock(slot.lock);
+
+    if (slot.isKV()) {
+        KeyType original_key = decodeKey(slot.data.kv.key.load(std::memory_order_acquire));
+        if (original_key != key) return false;
+        slot.data.kv.value = value;
+        return true;
+    }
+    if (slot.isPointer()) {
+        OverflowBuffer* buf = slot.data.overflowPtr.load(std::memory_order_acquire);
+        if (!buf || !buf->find(key).has_value()) return false;
+        if (!isHyperLockingEnabled()) {
+            buf->insert(key, value);
+            return true;
         }
+        OverflowBuffer* neu = buf->insertRCU(key, value);
+        slot.data.overflowPtr.store(neu, std::memory_order_release);
+        safeDelete(buf);
+        return true;
     }
     return false;
 }
@@ -506,27 +574,29 @@ bool LeafNode::checkPolicyTwo() {
         current_hist[i] = count;
     }
 
-    // Calculate Kolmogorov-Smirnov statistic
-    int sup_diff = 0;
+    int n = 0, m = 0;
+    for (int x : init_histogram_) n += x;
+    for (int x : current_hist) m += x;
+    if (n <= 0 || m <= 0) {
+        op_counter_.store(0, std::memory_order_relaxed);
+        return false;
+    }
+
+    // Two-sample KS on slot histograms; beta=0.005 (paper §3.3.1).
+    double d_stat = 0.0;
     int cumulative_init = 0;
     int cumulative_current = 0;
     for (size_t i = 0; i < current_hist.size(); i++) {
         cumulative_init += init_histogram_[i];
         cumulative_current += current_hist[i];
-        int diff = std::abs(cumulative_current - cumulative_init);
-        if (diff > sup_diff)
-            sup_diff = diff;
+        double diff = std::abs(static_cast<double>(cumulative_current) / m -
+                               static_cast<double>(cumulative_init) / n);
+        if (diff > d_stat) d_stat = diff;
     }
 
-    // Calculate sample sizes and threshold for significance
-    int n = 0, m = 0;
-    for (int x : init_histogram_) n += x;
-    for (int x : current_hist) m += x;
-    double threshold = 1.731 * std::sqrt((n + m) / static_cast<double>(n * m));
+    const double c_beta = std::sqrt(-0.5 * std::log(0.005 / 2.0));
+    double threshold = c_beta * std::sqrt((n + m) / static_cast<double>(n * m));
 
-    // Reset operation counter
     op_counter_.store(0, std::memory_order_relaxed);
-
-    // Return true if distribution shift is significant
-    return sup_diff > threshold;
+    return d_stat > threshold;
 }

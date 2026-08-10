@@ -95,6 +95,12 @@ public:
      */
     bool erase(KeyType key);
 
+    /**
+     * @brief Update an existing key's value (§4.4). Does not insert missing keys.
+     * @return true if the key was present and updated
+     */
+    bool update(KeyType key, ValueType value);
+
     /// Lower density ratio that triggers an in-leaf rebuild after delete (§4.4).
     static constexpr double kMinLeafDensity = 0.25;
 
@@ -168,6 +174,17 @@ public:
      */
     std::vector<std::pair<KeyType, void*>> buildLeaves(
             const std::vector<std::pair<KeyType, ValueType>>&& data);
+
+    /**
+     * @brief Build an inner subtree from sorted child descriptors (Algo 1 +
+     *        configuration search). Enforces max_node_size_ and rebalance.
+     */
+    void* buildInnerFromChildren(std::vector<std::pair<KeyType, void*>>& children);
+
+    /**
+     * @brief Estimated structural bytes for an M-inner covering @p n_keys children.
+     */
+    size_t estimateModelNodeBytes(size_t n_keys) const;
 
     /**
      * @brief Rebuilds a model inner node

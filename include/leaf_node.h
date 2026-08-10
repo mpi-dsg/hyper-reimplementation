@@ -16,6 +16,9 @@
  */
 constexpr KeyType MSB_MASK = 1ULL << 63;
 
+/// Paper §6.1 / §3.3.1: Policy 1 conflict threshold \(C^{max}_{leaf}\).
+constexpr size_t kMaxLeafConflicts = 256;
+
 /**
  * @enum InsertResult
  * @brief Result codes for insert operations
@@ -204,6 +207,12 @@ public:
     std::vector<std::pair<KeyType, ValueType>> gatherAll() const;
 
     /**
+     * @brief Replace the value for an existing key (§4.4). Does not insert.
+     * @return true if the key was present and updated
+     */
+    bool update(KeyType key, ValueType value);
+
+    /**
      * @brief Get the minimum key in the leaf node
      * @return Minimum key
      */
@@ -266,6 +275,27 @@ private:
     bool checkPolicyTwo();
 
     /**
+     * @brief Max conflict count in any slot (Policy 1 histogram peak).
+     */
+    size_t maxConflictCount() const;
+
+    /**
+     * @brief Number of keys currently mapped to slot @p idx.
+     */
+    size_t slotConflictCount(size_t idx) const;
+
+    /**
+     * @brief Insert into an overflow buffer (in-place when unlocked, RCU otherwise).
+     */
+    void overflowInsert(Slot& slot, KeyType key, ValueType value);
+
+    /**
+     * @brief Erase from an overflow buffer (in-place when unlocked, RCU otherwise).
+     * @return true if the key was removed
+     */
+    bool overflowErase(Slot& slot, KeyType key);
+
+    /**
      * @brief Performs the actual split operation with all locks held
      * @param data All data from the leaf node
      * @param delta Error bound for PLA
@@ -281,7 +311,8 @@ private:
     KeyType maxPossibleKey_;         // Maximum possible key for this node
     std::vector<Slot> slots_;        // Array of slots for storing data
 
-    std::atomic<uint32_t> op_counter_;            // Counter for operations to trigger Policy Two
+    // Paper §3.3.1: 16-bit op counter; wrap triggers Policy 2 check.
+    std::atomic<uint16_t> op_counter_;
     std::vector<int> init_histogram_; // Initial key distribution histogram
 };
 

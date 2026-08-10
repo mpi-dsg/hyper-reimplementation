@@ -107,10 +107,12 @@ public:
     // Convenience function for safe deletion with default deleter
     template<typename T>
     void safeDelete(T* ptr) {
+        if (ptr == nullptr) return;
 #if USE_EPOCHS == true
-        if (ptr != nullptr) {
-            retire(ptr, [](void* p) { delete static_cast<T*>(p); });
-        }
+        retire(ptr, [](void* p) { delete static_cast<T*>(p); });
+#else
+        // ST / epochs-off: reclaim immediately (RCU copies must not leak).
+        delete ptr;
 #endif
     }
 

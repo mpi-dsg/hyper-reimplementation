@@ -2,6 +2,7 @@
 #include "../include/configuration_search.h"
 #include "../include/epoch_manager.h"
 #include <algorithm>
+#include <cmath>
 
 Hyper::~Hyper() {
     // Clean up the root node and its children using safe deletion
@@ -79,28 +80,8 @@ void Hyper::bulkLoad(const std::vector<std::pair<KeyType, ValueType>>& data) {
                   std::make_move_iterator(highLeaves.begin()),
                   std::make_move_iterator(highLeaves.end()));
 
-    // Extract boundary keys from the leaf nodes.
-    std::vector<KeyType> boundary_keys;
-    boundary_keys.resize(leaves.size());
-    std::transform(leaves.begin(), leaves.end(), boundary_keys.begin(),
-                   [](const std::pair<KeyType, void*>& p) { return p.first; });
-
-    // Find optimal configuration for the root node.
-    ConfigurationSearch cs(boundary_keys, lambda_);
-    auto config = cs.search();
-
-    // Create the root model node with optimal parameters.
-    auto root = new ModelInnerNode(
-            config.best_slope,
-            boundary_keys.front(),
-            config.best_mr
-    );
-
-    // Insert all leaf nodes into the root.
-    root->bulkLoad(leaves, config.best_slot_counts, lambda_);
-
-    // Store the tagged root pointer.
-    root_ = tagPointer(root, NodeType::ModelInner);
+    // Algo 1 + configuration search (respects max_node_size_, rebalance).
+    root_.store(buildInnerFromChildren(leaves), std::memory_order_release);
 }
 
 
@@ -171,6 +152,74 @@ bool Hyper::erase(KeyType key) {
     // §4.4: rebuild leaf when density drops below the lower ratio.
     leaf->maybeRebuildLowDensity(kMinLeafDensity);
     return true;
+}
+
+bool Hyper::update(KeyType key, ValueType value) {
+    EpochManager::Guard guard;
+
+    void* cur = root_.load(std::memory_order_acquire);
+    if (cur == nullptr) return false;
+
+    while (!isLeafNode(cur)) {
+        if (isModelInnerNode(cur)) {
+            cur = taggedCast<ModelInnerNode>(cur)->findChild(key);
+        } else if (isSearchInnerNode(cur)) {
+            cur = taggedCast<SearchInnerNode>(cur)->findChild(key);
+        } else {
+            return false;
+        }
+        if (cur == nullptr) return false;
+    }
+
+    return taggedCast<LeafNode>(cur)->update(key, value);
+}
+
+size_t Hyper::estimateModelNodeBytes(size_t n_keys) const {
+    if (n_keys == 0) return sizeof(ModelInnerNode);
+    size_t mr = static_cast<size_t>(std::ceil(n_keys * (1.0 + lambda_)));
+    return sizeof(ModelInnerNode) + (mr + 1) * sizeof(ModelInnerNode::Slot);
+}
+
+void* Hyper::buildInnerFromChildren(std::vector<std::pair<KeyType, void*>>& children) {
+    if (children.empty()) return nullptr;
+    if (children.size() == 1) return children.front().second;
+
+    // Algo 1: recursively compress levels until a candidate root fits max_node_size_.
+    std::vector<std::pair<KeyType, void*>> level = std::move(children);
+    while (level.size() > 1 && estimateModelNodeBytes(level.size()) > max_node_size_) {
+        // Target children per node so estimated model size stays under the cap.
+        size_t max_keys = 2;
+        while (max_keys < level.size() &&
+               estimateModelNodeBytes(max_keys + 1) <= max_node_size_) {
+            ++max_keys;
+        }
+        max_keys = std::max<size_t>(max_keys, 2);
+
+        std::vector<std::pair<KeyType, void*>> next;
+        next.reserve((level.size() + max_keys - 1) / max_keys);
+        for (size_t i = 0; i < level.size();) {
+            size_t end = std::min(i + max_keys, level.size());
+            std::vector<std::pair<KeyType, void*>> slice(
+                std::make_move_iterator(level.begin() + static_cast<long>(i)),
+                std::make_move_iterator(level.begin() + static_cast<long>(end)));
+            KeyType min_key = slice.front().first;
+            void* node = buildInnerFromChildren(slice);
+            next.emplace_back(min_key, node);
+            i = end;
+        }
+        level = std::move(next);
+    }
+
+    if (level.size() == 1) return level.front().second;
+
+    std::vector<KeyType> keys(level.size());
+    std::transform(level.begin(), level.end(), keys.begin(),
+                   [](const auto& p) { return p.first; });
+    ConfigurationSearch cs(keys, lambda_);
+    auto config = cs.search();
+    auto* root = new ModelInnerNode(config.best_slope, keys.front(), config.best_mr);
+    root->bulkLoad(level, config.best_slot_counts, lambda_);
+    return tagPointer(root, NodeType::ModelInner);
 }
 
 void Hyper::insert(KeyType key, ValueType value) {
@@ -388,32 +437,11 @@ void Hyper::insertLeafDescriptors(const std::vector<std::pair<KeyType, void*>>& 
                             collectAllData(leafDesc.second, childData);
                             collectAllData(childPtr, childData);
 
-                            // Build new leaves from combined data
                             std::vector<std::pair<KeyType, void*>> newLeaves = buildLeaves(std::move(childData));
-
-                            // Extract boundary keys for configuration search
-                            std::vector<KeyType> boundaryKeys;
-                            boundaryKeys.resize(newLeaves.size());
-                            std::transform(newLeaves.begin(), newLeaves.end(), boundaryKeys.begin(),
-                                           [](const std::pair<KeyType, void*>& p) {return p.first;});
-
-                            // Find optimal configuration
-                            ConfigurationSearch cs(boundaryKeys, lambda_);
-                            auto config = cs.search();
-
-                            // Create new model node
-                            auto* newModelNode = new ModelInnerNode(
-                                    config.best_slope,
-                                    boundaryKeys.front(),
-                                    config.best_mr
-                            );
-
-                            // Insert all leaves into the new model
-                            newModelNode->bulkLoad(newLeaves, config.best_slot_counts, lambda_);
-                            void* taggedNewModel = tagPointer(newModelNode, NodeType::ModelInner);
-
-                            // Update parent to point to the new model
-                            mNode->updateChildWithExternalLock(boundaryKeys.front(), taggedNewModel);
+                            if (newLeaves.empty()) break;
+                            KeyType boundary = newLeaves.front().first;
+                            void* taggedNewModel = buildInnerFromChildren(newLeaves);
+                            mNode->updateChildWithExternalLock(boundary, taggedNewModel);
 
                             // Clean up old model node
 
@@ -777,38 +805,14 @@ void Hyper::rebuildModelNode(ModelInnerNode* modelNode, void* parentNode) {
         std::vector<std::pair<KeyType, ValueType>> allData;
         collectAllData(oldRoot, allData);
 
-        // Build new leaves from collected data
         std::vector<std::pair<KeyType, void*>> newLeaves = buildLeaves(std::move(allData));
+        if (newLeaves.empty()) return;
+        void* taggedNewModelNode = buildInnerFromChildren(newLeaves);
 
-        // Extract boundary keys for configuration search
-        std::vector<KeyType> newBoundaryKeys;
-        newBoundaryKeys.resize(newLeaves.size());
-        std::transform(newLeaves.begin(), newLeaves.end(), newBoundaryKeys.begin(),
-                       [](const std::pair<KeyType, void*>& p) { return p.first; });
-
-        // Find optimal configuration
-        ConfigurationSearch cs(newBoundaryKeys, lambda_);
-        auto config = cs.search();
-
-        // Create new model node with optimal parameters
-        auto* newModelNode = new ModelInnerNode(
-                config.best_slope,
-                newBoundaryKeys.front(),
-                config.best_mr
-        );
-
-        // Insert all leaves into the new model
-        newModelNode->bulkLoad(newLeaves, config.best_slot_counts, lambda_);
-        void* taggedNewModelNode = tagPointer(newModelNode, NodeType::ModelInner);
-
-        // Try RCU update
         if (!updateRootRCU(oldRoot, taggedNewModelNode)) {
-            // Root changed during rebuild, clean up and let caller retry
-            safeDelete(newModelNode);
+            // Root changed; orphaned rebuild tree is abandoned (retry path).
             return;
         }
-        
-        // Successfully updated root via RCU
         return;
         
     } else if (isModelInnerNode(parentNode)) {
@@ -838,43 +842,22 @@ void Hyper::rebuildModelNode(ModelInnerNode* modelNode, void* parentNode) {
         parentLock = std::unique_lock<std::mutex>(searchParent->structural_lock_);
     }
 
-    // Collect all data from the model node subtree
     std::vector<std::pair<KeyType, ValueType>> allData;
     collectAllData(tagPointer(modelNode, NodeType::ModelInner), allData);
 
-    // Build new leaves from collected data
     std::vector<std::pair<KeyType, void*>> newLeaves = buildLeaves(std::move(allData));
-
-    // Extract boundary keys for configuration search
-    std::vector<KeyType> newBoundaryKeys;
-    newBoundaryKeys.resize(newLeaves.size());
-    std::transform(newLeaves.begin(), newLeaves.end(), newBoundaryKeys.begin(),
-                   [](const std::pair<KeyType, void*>& p) { return p.first; });
-
-    // Find optimal configuration
-    ConfigurationSearch cs(newBoundaryKeys, lambda_);
-    auto config = cs.search();
-
-    // Create new model node with optimal parameters
-    auto* newModelNode = new ModelInnerNode(
-            config.best_slope,
-            newBoundaryKeys.front(),
-            config.best_mr
-    );
-
-    // Insert all leaves into the new model
-    newModelNode->bulkLoad(newLeaves, config.best_slot_counts, lambda_);
-    void* taggedNewModelNode = tagPointer(newModelNode, NodeType::ModelInner);
+    if (newLeaves.empty()) return;
+    KeyType boundary = newLeaves.front().first;
+    void* taggedNewModelNode = buildInnerFromChildren(newLeaves);
 
     // Update parent based on parent type (non-root cases)
     if (isModelInnerNode(parentNode)) {
-        // Parent is a model inner node - use updateChildWithExternalLock
         auto* modelParent = taggedCast<ModelInnerNode>(parentNode);
-        modelParent->updateChildWithExternalLock(newBoundaryKeys.front(), taggedNewModelNode);
+        modelParent->updateChildWithExternalLock(boundary, taggedNewModelNode);
     } else if (isSearchInnerNode(parentNode)) {
         // Parent is a search inner node - replace the child
         auto* searchParent = taggedCast<SearchInnerNode>(parentNode);
-        searchParent->addChild(newBoundaryKeys.front(), taggedNewModelNode);
+        searchParent->addChild(boundary, taggedNewModelNode);
     }
 
     // Clean up old model node using safe deletion
@@ -981,37 +964,14 @@ void Hyper::convertSearchNodeToModelNode(SearchInnerNode* sNode, void* parentNod
     std::vector<std::pair<KeyType, ValueType>> subtreeData;
     collectAllData(taggedSearchNode, subtreeData);
 
-    // Build new leaves from leaf data
     std::vector<std::pair<KeyType, void*>> newLeaves = buildLeaves(std::move(subtreeData));
     if (newLeaves.empty()) {
         return;
     }
+    KeyType boundary = newLeaves.front().first;
+    void* taggedNewModelNode = buildInnerFromChildren(newLeaves);
 
-    // Extract boundary keys for configuration search
-    std::vector<KeyType> newBoundaryKeys;
-    newBoundaryKeys.resize(newLeaves.size());
-    std::transform(newLeaves.begin(), newLeaves.end(), newBoundaryKeys.begin(),
-                   [](const std::pair<KeyType, void*>& p) { return p.first; });
-
-    // Find optimal configuration
-    ConfigurationSearch cs(newBoundaryKeys, lambda_);
-    auto config = cs.search();
-
-    // Create new model node with optimal parameters
-    auto* newModelNode = new ModelInnerNode(
-            config.best_slope,
-            newBoundaryKeys.front(),
-            config.best_mr
-    );
-
-    // Insert all leaves into the new model
-    newModelNode->bulkLoad(newLeaves, config.best_slot_counts, lambda_);
-    void* taggedNewModelNode = tagPointer(newModelNode, NodeType::ModelInner);
-
-    // Update parent using updateChildWithExternalLock since we hold the slot lock
-    modelParent->updateChildWithExternalLock(newBoundaryKeys.front(), taggedNewModelNode);
-
-    // Clean up old search node using safe deletion
+    modelParent->updateChildWithExternalLock(boundary, taggedNewModelNode);
     safeDelete(sNode);
 }
 
@@ -1089,18 +1049,7 @@ InsertResult Hyper::handleRootUpdate(void* oldRoot, const std::vector<std::pair<
         searchRoot->bulk_load(allChildren);
         newRoot = tagPointer(searchRoot, NodeType::SearchInner);
     } else {
-        // Use model inner node with configuration search
-        std::vector<KeyType> keys;
-        keys.reserve(allChildren.size());
-        std::transform(allChildren.begin(), allChildren.end(), std::back_inserter(keys),
-                      [](const auto& p) { return p.first; });
-        
-        ConfigurationSearch cs(keys, lambda_);
-        auto config = cs.search();
-        
-        auto* modelRoot = new ModelInnerNode(config.best_slope, keys.front(), config.best_mr);
-        modelRoot->bulkLoad(allChildren, config.best_slot_counts, lambda_);
-        newRoot = tagPointer(modelRoot, NodeType::ModelInner);
+        newRoot = buildInnerFromChildren(allChildren);
     }
     
     // Atomically update root
