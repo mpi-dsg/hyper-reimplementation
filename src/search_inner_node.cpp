@@ -19,7 +19,10 @@ SearchInnerNode::~SearchInnerNode() {
 }
 
 void SearchInnerNode::addChild(KeyType boundaryKey, void* child) {
-    std::lock_guard<std::mutex> guard(structural_lock_);
+    std::unique_lock<std::mutex> guard(structural_lock_, std::defer_lock);
+    if (isHyperLockingEnabled()) {
+        guard.lock();
+    }
 
     incrementVersion();
 

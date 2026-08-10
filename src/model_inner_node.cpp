@@ -117,53 +117,7 @@ void* ModelInnerNode::findChild(KeyType key) const {
 }
 
 void ModelInnerNode::setChild(KeyType key, void* child) {
-    bool success = false;
-
-    while (!success) {
-        // Predict the slot for this key
-        size_t idx = predictSlot(key);
-
-        // Collect slots that need to be locked
-        std::vector<size_t> slots_to_lock;
-        slots_to_lock.push_back(idx);
-
-        // Find all consecutive duplicate slots to the right
-        for (size_t i = idx + 1; i < slots_.size(); i++) {
-            KeyType tempKey;
-            void* tempChild;
-            bool isReal;
-            readSlotSeqLock(i, tempKey, tempChild, isReal);
-
-            if (isReal) {
-                break;
-            }
-            slots_to_lock.push_back(i);
-        }
-
-        // Try to acquire all locks in reverse order (rightmost first) to avoid deadlock
-        std::vector<std::unique_lock<std::mutex>> locks;
-        locks.reserve(slots_to_lock.size());
-
-        bool all_locked = true;
-        for (auto it = slots_to_lock.rbegin(); it != slots_to_lock.rend(); ++it) {
-            std::unique_lock<std::mutex> lock(slots_[*it].lock, std::try_to_lock);
-            if (!lock.owns_lock()) {
-                // Failed to acquire lock - release all and retry
-                all_locked = false;
-                break;
-            }
-            locks.push_back(std::move(lock));
-        }
-
-        if (!all_locked) {
-            // Release all locks and retry from the beginning
-            locks.clear();
-            std::this_thread::yield();
-            continue;
-        }
-
-        // Mutexes held: read old slot state BEFORE beginWrite. Calling
-        // readSlotSeqLock after beginWrite deadlocks (odd version spin).
+    auto apply = [&](size_t idx, const std::vector<size_t>& slots_to_lock) {
         const bool wasReal = slots_[idx].isRealChild();
         void* oldChild = wasReal ? slots_[idx].KeyChildPtr.second : slots_[idx].getChildPtr();
         size_t newChildLeafCount = countLeafNodesInSubtree(child);
@@ -174,7 +128,6 @@ void ModelInnerNode::setChild(KeyType key, void* child) {
 
         if (wasReal) {
             size_t oldChildLeafCount = countLeafNodesInSubtree(oldChild);
-
             if (newChildLeafCount > oldChildLeafCount) {
                 leaf_node_count_.fetch_add(newChildLeafCount - oldChildLeafCount, std::memory_order_relaxed);
             } else if (oldChildLeafCount > newChildLeafCount) {
@@ -200,56 +153,58 @@ void ModelInnerNode::setChild(KeyType key, void* child) {
         for (size_t i = 0; i < slots_to_lock.size(); i++) {
             slots_[slots_to_lock[i]].endWrite();
         }
+    };
 
-        success = true;
-    }
-}
-
-void ModelInnerNode::updateChildWithExternalLock(KeyType key, void* child) {
-    bool success = false;
-
-    while (!success) {
-        // Predict the slot for this key
-        size_t idx = predictSlot(key);
-
-        // Collect additional slots that need to be locked (excluding main slot which should already be locked)
-        std::vector<size_t> additional_slots_to_lock;
-
-        // Find all consecutive duplicate slots to the right
+    auto collect_slots = [&](size_t idx) {
+        std::vector<size_t> slots_to_lock;
+        slots_to_lock.push_back(idx);
         for (size_t i = idx + 1; i < slots_.size(); i++) {
             KeyType tempKey;
             void* tempChild;
             bool isReal;
             readSlotSeqLock(i, tempKey, tempChild, isReal);
-
-            if (isReal) {
-                break;
-            }
-            additional_slots_to_lock.push_back(i);
+            if (isReal) break;
+            slots_to_lock.push_back(i);
         }
+        return slots_to_lock;
+    };
 
-        // Try to acquire additional locks in reverse order
-        std::vector<std::unique_lock<std::mutex>> additional_locks;
-        additional_locks.reserve(additional_slots_to_lock.size());
+    if (!isHyperLockingEnabled()) {
+        size_t idx = predictSlot(key);
+        apply(idx, collect_slots(idx));
+        return;
+    }
 
-        bool all_additional_locked = true;
-        for (auto it = additional_slots_to_lock.rbegin(); it != additional_slots_to_lock.rend(); ++it) {
+    bool success = false;
+    while (!success) {
+        size_t idx = predictSlot(key);
+        auto slots_to_lock = collect_slots(idx);
+
+        std::vector<std::unique_lock<std::mutex>> locks;
+        locks.reserve(slots_to_lock.size());
+        bool all_locked = true;
+        for (auto it = slots_to_lock.rbegin(); it != slots_to_lock.rend(); ++it) {
             std::unique_lock<std::mutex> lock(slots_[*it].lock, std::try_to_lock);
             if (!lock.owns_lock()) {
-                // Failed to acquire lock - release all and retry
-                all_additional_locked = false;
+                all_locked = false;
                 break;
             }
-            additional_locks.push_back(std::move(lock));
+            locks.push_back(std::move(lock));
         }
 
-        if (!all_additional_locked) {
-            additional_locks.clear();
+        if (!all_locked) {
+            locks.clear();
             std::this_thread::yield();
             continue;
         }
 
-        // Read old state before beginWrite (mutex held; avoid seqlock self-deadlock).
+        apply(idx, slots_to_lock);
+        success = true;
+    }
+}
+
+void ModelInnerNode::updateChildWithExternalLock(KeyType key, void* child) {
+    auto apply = [&](size_t idx, const std::vector<size_t>& additional_slots_to_lock) {
         const bool wasReal = slots_[idx].isRealChild();
         void* oldChild = wasReal ? slots_[idx].KeyChildPtr.second : slots_[idx].getChildPtr();
         size_t newChildLeafCount = countLeafNodesInSubtree(child);
@@ -261,7 +216,6 @@ void ModelInnerNode::updateChildWithExternalLock(KeyType key, void* child) {
 
         if (wasReal) {
             size_t oldChildLeafCount = countLeafNodesInSubtree(oldChild);
-
             if (newChildLeafCount > oldChildLeafCount) {
                 leaf_node_count_.fetch_add(newChildLeafCount - oldChildLeafCount, std::memory_order_relaxed);
             } else if (oldChildLeafCount > newChildLeafCount) {
@@ -288,7 +242,51 @@ void ModelInnerNode::updateChildWithExternalLock(KeyType key, void* child) {
             slots_[slotIdx].endWrite();
         }
         slots_[idx].endWrite();
+    };
 
+    auto collect_additional = [&](size_t idx) {
+        std::vector<size_t> additional_slots_to_lock;
+        for (size_t i = idx + 1; i < slots_.size(); i++) {
+            KeyType tempKey;
+            void* tempChild;
+            bool isReal;
+            readSlotSeqLock(i, tempKey, tempChild, isReal);
+            if (isReal) break;
+            additional_slots_to_lock.push_back(i);
+        }
+        return additional_slots_to_lock;
+    };
+
+    if (!isHyperLockingEnabled()) {
+        size_t idx = predictSlot(key);
+        apply(idx, collect_additional(idx));
+        return;
+    }
+
+    bool success = false;
+    while (!success) {
+        size_t idx = predictSlot(key);
+        auto additional_slots_to_lock = collect_additional(idx);
+
+        std::vector<std::unique_lock<std::mutex>> additional_locks;
+        additional_locks.reserve(additional_slots_to_lock.size());
+        bool all_additional_locked = true;
+        for (auto it = additional_slots_to_lock.rbegin(); it != additional_slots_to_lock.rend(); ++it) {
+            std::unique_lock<std::mutex> lock(slots_[*it].lock, std::try_to_lock);
+            if (!lock.owns_lock()) {
+                all_additional_locked = false;
+                break;
+            }
+            additional_locks.push_back(std::move(lock));
+        }
+
+        if (!all_additional_locked) {
+            additional_locks.clear();
+            std::this_thread::yield();
+            continue;
+        }
+
+        apply(idx, additional_slots_to_lock);
         success = true;
     }
 }

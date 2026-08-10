@@ -429,9 +429,10 @@ void Hyper::insertLeafDescriptors(const std::vector<std::pair<KeyType, void*>>& 
                         if (leafDesc.first < childModelNode->getMinKey()) {
                             // Special case: Need to rebuild subtree
 
-                            // Lock the slot to ensure consistent reads during collectAllData
-                            std::mutex& slotLock = mNode->getSlotLock(slotIdx);
-                            std::lock_guard<std::mutex> slotGuard(slotLock);
+                            std::unique_lock<std::mutex> slotGuard(mNode->getSlotLock(slotIdx), std::defer_lock);
+                            if (isHyperLockingEnabled()) {
+                                slotGuard.lock();
+                            }
 
                             std::vector<std::pair<KeyType, ValueType>> childData;
                             collectAllData(leafDesc.second, childData);
@@ -833,13 +834,14 @@ void Hyper::rebuildModelNode(ModelInnerNode* modelNode, void* parentNode) {
             }
         }
 
-        if (found) {
+        if (found && isHyperLockingEnabled()) {
             parentLock = std::unique_lock<std::mutex>(modelParent->getSlotLock(slotIdx));
         }
     } else if (isSearchInnerNode(parentNode)) {
-        // Parent is a search inner node - lock structural lock
         auto* searchParent = taggedCast<SearchInnerNode>(parentNode);
-        parentLock = std::unique_lock<std::mutex>(searchParent->structural_lock_);
+        if (isHyperLockingEnabled()) {
+            parentLock = std::unique_lock<std::mutex>(searchParent->structural_lock_);
+        }
     }
 
     std::vector<std::pair<KeyType, ValueType>> allData;
@@ -951,8 +953,9 @@ void Hyper::convertSearchNodeToModelNode(SearchInnerNode* sNode, void* parentNod
         }
     }
 
-    // Lock the specific slot
-    parentLock = std::unique_lock<std::mutex>(modelParent->getSlotLock(slotIdx));
+    if (isHyperLockingEnabled()) {
+        parentLock = std::unique_lock<std::mutex>(modelParent->getSlotLock(slotIdx));
+    }
 
     // Get the key for this search node (needed for updating parent)
     const auto& slot = modelParent->getSlots()[slotIdx];
