@@ -70,7 +70,7 @@ public:
             std::atomic<OverflowBuffer*> overflowPtr; // Pointer to overflow buffer with MSB of 0
         } data;
 
-        mutable std::mutex lock;  // Mutex for this specific slot
+        mutable HyperSlotMutex lock;  // Allocated only when locking enabled
 
         Slot();
         ~Slot();
@@ -255,7 +255,13 @@ public:
      * @brief Try to acquire all slot locks (for split operations)
      * @return vector of unique_locks if successful, empty vector if any lock fails
      */
-    std::vector<std::unique_lock<std::mutex>> tryLockAllSlots();
+    std::vector<std::unique_lock<HyperSlotMutex>> tryLockAllSlots();
+
+    /**
+     * @brief Policy 1 cheap retrain: rebuild leaf model in place when a single
+     *        PLA segment still fits; returns false if a split is required.
+     */
+    bool tryRetrainInPlace(double delta);
 
 private:
     /**

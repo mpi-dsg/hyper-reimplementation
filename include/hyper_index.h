@@ -129,7 +129,12 @@ public:
      * @param leafDescs Vector of key-leaf pairs to insert
      */
     void insertLeafDescriptors(const std::vector<std::pair<KeyType, void*>>& leafDescs,
-                               std::unique_lock<std::mutex>& parentLock);
+                               std::unique_lock<HyperSlotMutex>& parentLock);
+
+    /**
+     * @brief Scan up to @p limit keys starting at @p start (inclusive).
+     */
+    std::vector<std::pair<KeyType, ValueType>> scan(KeyType start, size_t limit) const;
 
     /**
      * @brief Executes a range query to find all key-value pairs in a range
@@ -208,6 +213,9 @@ public:
     void convertSearchNodeToModelNode(SearchInnerNode* sNode, void* parentNode);
 
 private:
+    std::vector<std::pair<KeyType, ValueType>> rangeQuery(KeyType left, KeyType right,
+                                                          size_t limit) const;
+
     std::atomic<void*> root_{nullptr};        ///< Root node of the index
     std::mutex root_update_lock_;             ///< Lock only for root updates, not traversals
     double delta_;                            ///< Error bound for PLA

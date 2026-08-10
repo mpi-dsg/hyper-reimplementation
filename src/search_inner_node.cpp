@@ -19,7 +19,7 @@ SearchInnerNode::~SearchInnerNode() {
 }
 
 void SearchInnerNode::addChild(KeyType boundaryKey, void* child) {
-    std::unique_lock<std::mutex> guard(structural_lock_, std::defer_lock);
+    std::unique_lock<HyperSlotMutex> guard(structural_lock_, std::defer_lock);
     if (isHyperLockingEnabled()) {
         guard.lock();
     }
@@ -116,14 +116,15 @@ void* SearchInnerNode::getChildAtIndex(int idx) const {
 }
 
 std::pair<std::mutex*, void*> SearchInnerNode::getSlotLockAndChild(int idx) {
-    // For lock access, we need to hold structural lock to ensure stability
-    std::lock_guard<std::mutex> guard(structural_lock_);
+    std::unique_lock<HyperSlotMutex> guard(structural_lock_, std::defer_lock);
+    if (isHyperLockingEnabled()) {
+        guard.lock();
+    }
 
     if (idx < 0 || idx >= static_cast<int>(children_.size())) {
         return {nullptr, nullptr};
     }
 
-    // Return both lock pointer and child pointer atomically
     return {children_[idx].lock.get(), children_[idx].childPtr};
 }
 

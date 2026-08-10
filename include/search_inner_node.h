@@ -16,19 +16,20 @@
  */
 class SearchInnerNode {
 public:
-    mutable std::mutex  structural_lock_;               ///< Lock for structural changes
+    mutable HyperSlotMutex structural_lock_;            ///< Allocated only when locking enabled
     struct ChildEntry {
         KeyType boundaryKey;
         void* childPtr;
         mutable std::unique_ptr<std::mutex> lock;
 
         ChildEntry(KeyType key, void* ptr)
-                : boundaryKey(key), childPtr(ptr), lock(std::make_unique<std::mutex>()) {}
+                : boundaryKey(key), childPtr(ptr),
+                  lock(isHyperLockingEnabled() ? std::make_unique<std::mutex>() : nullptr) {}
 
         // Copy constructor for RCU updates
         ChildEntry(const ChildEntry& other)
                 : boundaryKey(other.boundaryKey), childPtr(other.childPtr),
-                  lock(std::make_unique<std::mutex>()) {}
+                  lock(isHyperLockingEnabled() ? std::make_unique<std::mutex>() : nullptr) {}
 
         // Move constructor
         ChildEntry(ChildEntry&& other) noexcept

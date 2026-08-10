@@ -57,6 +57,8 @@ int main() {
         }
         CHECK(idx.find(9).has_value(), "post-growth find");
         CHECK(idx.memoryStats().total_bytes() > 0, "memory stats live");
+        auto s = idx.scan(1, 10);
+        CHECK(s.size() == 10, "scan returns requested count");
     }
 
     Hyper::setLockingEnabled(true);

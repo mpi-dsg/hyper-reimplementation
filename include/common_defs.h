@@ -35,18 +35,48 @@ inline bool isHyperLockingEnabled() {
 }
 
 /**
+ * @brief Per-slot lock that allocates a real mutex only when locking is enabled.
+ *        In single-thread mode this is a null pointer (no mutex footprint).
+ */
+class HyperSlotMutex {
+public:
+    HyperSlotMutex() {
+        if (isHyperLockingEnabled()) {
+            mu_ = new std::mutex();
+        }
+    }
+    ~HyperSlotMutex() { delete mu_; }
+    HyperSlotMutex(const HyperSlotMutex&) = delete;
+    HyperSlotMutex& operator=(const HyperSlotMutex&) = delete;
+
+    void lock() {
+        if (mu_) mu_->lock();
+    }
+    void unlock() {
+        if (mu_) mu_->unlock();
+    }
+    bool try_lock() {
+        return mu_ ? mu_->try_lock() : true;
+    }
+    bool allocated() const { return mu_ != nullptr; }
+
+private:
+    std::mutex* mu_ = nullptr;
+};
+
+/**
  * @brief Mutex guard that is a no-op when Hyper locking is disabled.
  */
 class MaybeLock {
 public:
-    explicit MaybeLock(std::mutex& m) : lock_(m, std::defer_lock) {
+    explicit MaybeLock(HyperSlotMutex& m) : lock_(m, std::defer_lock) {
         if (isHyperLockingEnabled()) {
             lock_.lock();
         }
     }
 
 private:
-    std::unique_lock<std::mutex> lock_;
+    std::unique_lock<HyperSlotMutex> lock_;
 };
 
 /**

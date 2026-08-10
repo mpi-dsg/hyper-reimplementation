@@ -183,7 +183,7 @@ InsertReturn LeafNode::insert(
     size_t idx = predictSlot(key);
     bool needsSplit = false;
 
-    std::unique_lock<std::mutex> slotLock(slots_[idx].lock, std::defer_lock);
+    std::unique_lock<HyperSlotMutex> slotLock(slots_[idx].lock, std::defer_lock);
     if (isHyperLockingEnabled()) {
         slotLock.lock();
     }
@@ -211,10 +211,12 @@ InsertReturn LeafNode::insert(
     }
 
     size_t conflicts = slotConflictCount(idx);
-    // Policy 1: C^max_leaf, and Corollary 3.1 overflow bound.
-    if (conflicts >= kMaxLeafConflicts || conflicts > static_cast<size_t>(2 * delta + 1)) {
+    // Corollary 3.1 hard bound requires a split.
+    if (conflicts > static_cast<size_t>(2 * delta + 1)) {
         needsSplit = true;
     }
+    // Policy 1: try cheap in-place retrain when C^max_leaf is exceeded.
+    bool needsRetrain = !needsSplit && conflicts >= kMaxLeafConflicts;
 
     if (slotLock.owns_lock()) {
         slotLock.unlock();
@@ -223,6 +225,13 @@ InsertReturn LeafNode::insert(
     // Policy 2: check KS divergence when the 16-bit op counter wraps.
     uint16_t prev = op_counter_.fetch_add(1, std::memory_order_relaxed);
     if (static_cast<uint16_t>(prev + 1) == 0 && checkPolicyTwo()) {
+        needsRetrain = true;
+    }
+
+    if (needsRetrain && !needsSplit) {
+        if (tryRetrainInPlace(delta)) {
+            return InsertReturn(InsertResult::Success);
+        }
         needsSplit = true;
     }
 
@@ -479,22 +488,67 @@ bool LeafNode::hasAnySlotLocked() const {
     return false;
 }
 
-std::vector<std::unique_lock<std::mutex>> LeafNode::tryLockAllSlots() {
-    std::vector<std::unique_lock<std::mutex>> locks;
+std::vector<std::unique_lock<HyperSlotMutex>> LeafNode::tryLockAllSlots() {
+    std::vector<std::unique_lock<HyperSlotMutex>> locks;
     locks.reserve(slots_.size());
 
-    // Try to acquire all locks
     for (auto& slot : slots_) {
-        std::unique_lock<std::mutex> lock(slot.lock, std::try_to_lock);
+        std::unique_lock<HyperSlotMutex> lock(slot.lock, std::try_to_lock);
         if (!lock.owns_lock()) {
-            // Failed to acquire a lock, release all previously acquired locks
             locks.clear();
-            return locks; // Return empty vector to indicate failure
+            return locks;
         }
         locks.push_back(std::move(lock));
     }
 
-    return locks; // Return all locks if successful
+    return locks;
+}
+
+bool LeafNode::tryRetrainInPlace(double delta) {
+    auto data = gatherAll();
+    if (data.size() < 2) return true;
+
+    std::vector<Hyper::PLASegment> segments;
+    KeyType maxKey = data.back().first;
+    hyperpgm::internal::make_segmentation_par(
+            data.size(),
+            static_cast<size_t>(delta),
+            [&](size_t i) { return data[i].first; },
+            [&](const auto& cs) {
+                Hyper::PLASegment seg{};
+                seg.min_key = cs.get_first_x();
+                seg.max_key = cs.get_last_x();
+                if (cs.get_last_x() >= maxKey) seg.max_key = data.back().first;
+                auto [segSlope, intercept] = cs.get_floating_point_segment(seg.min_key);
+                (void)intercept;
+                seg.slope = segSlope;
+                auto start_it = std::lower_bound(data.begin(), data.end(), seg.min_key,
+                                                 [](const auto& pair, KeyType key) { return pair.first < key; });
+                seg.start_idx = std::distance(data.begin(), start_it);
+                auto end_it = std::lower_bound(data.begin(), data.end(), seg.max_key,
+                                               [](const auto& pair, KeyType key) { return pair.first < key; });
+                seg.end_idx = std::distance(data.begin(), end_it);
+                segments.push_back(seg);
+            });
+    if (!segments.empty() && segments.back().start_idx >= data.size()) {
+        segments.pop_back();
+    }
+
+    // Cheap retrain only when a single PLA segment still covers the leaf.
+    if (segments.size() != 1) return false;
+
+    const auto& seg = segments.front();
+    KeyType saved_max = maxPossibleKey_;
+    for (auto& slot : slots_) {
+        slot.destroy();
+    }
+    slope_ = seg.slope;
+    minKey_ = seg.min_key;
+    MR_ = static_cast<size_t>(std::ceil(slope_ * static_cast<double>(seg.max_key - minKey_)));
+    slots_ = std::vector<Slot>(MR_ + 1);
+    maxPossibleKey_ = saved_max;
+    bulkLoad(std::move(data));
+    return maxConflictCount() < kMaxLeafConflicts;
 }
 
 std::vector<std::pair<KeyType, void*>> LeafNode::performSplit(

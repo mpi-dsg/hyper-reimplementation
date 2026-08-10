@@ -180,11 +180,11 @@ void ModelInnerNode::setChild(KeyType key, void* child) {
         size_t idx = predictSlot(key);
         auto slots_to_lock = collect_slots(idx);
 
-        std::vector<std::unique_lock<std::mutex>> locks;
+        std::vector<std::unique_lock<HyperSlotMutex>> locks;
         locks.reserve(slots_to_lock.size());
         bool all_locked = true;
         for (auto it = slots_to_lock.rbegin(); it != slots_to_lock.rend(); ++it) {
-            std::unique_lock<std::mutex> lock(slots_[*it].lock, std::try_to_lock);
+            std::unique_lock<HyperSlotMutex> lock(slots_[*it].lock, std::try_to_lock);
             if (!lock.owns_lock()) {
                 all_locked = false;
                 break;
@@ -268,11 +268,11 @@ void ModelInnerNode::updateChildWithExternalLock(KeyType key, void* child) {
         size_t idx = predictSlot(key);
         auto additional_slots_to_lock = collect_additional(idx);
 
-        std::vector<std::unique_lock<std::mutex>> additional_locks;
+        std::vector<std::unique_lock<HyperSlotMutex>> additional_locks;
         additional_locks.reserve(additional_slots_to_lock.size());
         bool all_additional_locked = true;
         for (auto it = additional_slots_to_lock.rbegin(); it != additional_slots_to_lock.rend(); ++it) {
-            std::unique_lock<std::mutex> lock(slots_[*it].lock, std::try_to_lock);
+            std::unique_lock<HyperSlotMutex> lock(slots_[*it].lock, std::try_to_lock);
             if (!lock.owns_lock()) {
                 all_additional_locked = false;
                 break;
@@ -459,7 +459,7 @@ void* ModelInnerNode::getChildAtIndex(size_t idx) const {
     return child;
 }
 
-std::tuple<std::unique_lock<std::mutex>, void*, size_t> ModelInnerNode::findChildWithLock(KeyType key) {
+std::tuple<std::unique_lock<HyperSlotMutex>, void*, size_t> ModelInnerNode::findChildWithLock(KeyType key) {
     size_t idx = predictSlot(key);
 
     KeyType slotKey;
@@ -480,7 +480,7 @@ std::tuple<std::unique_lock<std::mutex>, void*, size_t> ModelInnerNode::findChil
 
         if (isReal) {
             // Found real child in current slot
-            std::unique_lock<std::mutex> lock(slots_[finalSlotIdx].lock);
+            std::unique_lock<HyperSlotMutex> lock(slots_[finalSlotIdx].lock);
             return {std::move(lock), slotChild, finalSlotIdx};
         } else {
             // This is a duplicate slot - we need to find the real slot that owns this child
@@ -505,7 +505,7 @@ std::tuple<std::unique_lock<std::mutex>, void*, size_t> ModelInnerNode::findChil
         }
     }
 
-    std::unique_lock<std::mutex> lock(slots_[finalSlotIdx].lock);
+    std::unique_lock<HyperSlotMutex> lock(slots_[finalSlotIdx].lock);
     return {std::move(lock), slotChild, finalSlotIdx};
 }
 

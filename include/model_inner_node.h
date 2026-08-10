@@ -37,7 +37,7 @@ public:
             } dupData{};
         };
 
-        mutable std::mutex lock;                        // writer synchronization
+        mutable HyperSlotMutex lock;                    // allocated only when locking enabled
         mutable std::atomic<uint64_t> version{0};    // seq lock version counter
 
         /**
@@ -235,7 +235,7 @@ public:
      * @param idx Index of the slot
      * @return Reference to the slot's lock
      */
-    std::mutex& getSlotLock(size_t idx) {
+    HyperSlotMutex& getSlotLock(size_t idx) {
         return slots_[idx].lock;
     }
 
@@ -253,7 +253,7 @@ public:
      * @param key Key to find child for
      * @return Tuple of {lock, child_pointer, slot_index}
      */
-    std::tuple<std::unique_lock<std::mutex>, void*, size_t> findChildWithLock(KeyType key);
+    std::tuple<std::unique_lock<HyperSlotMutex>, void*, size_t> findChildWithLock(KeyType key);
 
     /**
     * @brief Checks if all slots are unlocked

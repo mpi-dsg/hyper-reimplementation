@@ -86,8 +86,8 @@ void Hyper::bulkLoad(const std::vector<std::pair<KeyType, ValueType>>& data) {
 
 
 std::optional<ValueType> Hyper::find(KeyType key) const {
-    //EpochManager::Guard guard; // Protect the entire find operation
-    
+    EPOCH_GUARD();
+
     void* cur = root_.load(std::memory_order_acquire);
 
     // Traverse the tree to find the leaf node containing the key
@@ -369,7 +369,7 @@ InsertResult Hyper::insertAttempt(KeyType key, ValueType value) {
                     return handleRootUpdate(rootSnapshot, *insertReturn.splitDescriptors);
                 } else {
                     // Normal split, insert descriptors
-                    std::unique_lock<std::mutex> parentLock;
+                    std::unique_lock<HyperSlotMutex> parentLock;
                     insertLeafDescriptors(*insertReturn.splitDescriptors, parentLock);
                 }
             }
@@ -383,7 +383,7 @@ InsertResult Hyper::insertAttempt(KeyType key, ValueType value) {
 }
 
 void Hyper::insertLeafDescriptors(const std::vector<std::pair<KeyType, void*>>& leafDescs,
-                                  std::unique_lock<std::mutex>& parentLock) {
+                                  std::unique_lock<HyperSlotMutex>& parentLock) {
     // Track model nodes that might need rebuilding
     std::set<std::pair<ModelInnerNode*, void*>> modelNodesWithParent;
     std::set<std::pair<SearchInnerNode*, void*>> searchNodesWithParent;
@@ -429,7 +429,7 @@ void Hyper::insertLeafDescriptors(const std::vector<std::pair<KeyType, void*>>& 
                         if (leafDesc.first < childModelNode->getMinKey()) {
                             // Special case: Need to rebuild subtree
 
-                            std::unique_lock<std::mutex> slotGuard(mNode->getSlotLock(slotIdx), std::defer_lock);
+                            std::unique_lock<HyperSlotMutex> slotGuard(mNode->getSlotLock(slotIdx), std::defer_lock);
                             if (isHyperLockingEnabled()) {
                                 slotGuard.lock();
                             }
@@ -517,13 +517,23 @@ void Hyper::insertLeafDescriptors(const std::vector<std::pair<KeyType, void*>>& 
 }
 
 
+std::vector<std::pair<KeyType, ValueType>> Hyper::scan(KeyType start, size_t limit) const {
+    // Count-bounded forward scan from start (paper §4.1-style leaf walk).
+    return rangeQuery(start, std::numeric_limits<KeyType>::max(), limit);
+}
+
 std::vector<std::pair<KeyType, ValueType>> Hyper::rangeQuery(KeyType left, KeyType right) const {
-    EpochManager::Guard guard; // Protect the entire range query operation
+    return rangeQuery(left, right, std::numeric_limits<size_t>::max());
+}
+
+std::vector<std::pair<KeyType, ValueType>> Hyper::rangeQuery(KeyType left, KeyType right,
+                                                             size_t limit) const {
+    EPOCH_GUARD();
     
     std::vector<std::pair<KeyType, ValueType>> result;
 
     // Early exit for invalid range or empty index
-    if (left > right || root_ == nullptr) {
+    if (limit == 0 || left > right || root_ == nullptr) {
         return result;
     }
 
@@ -580,17 +590,18 @@ std::vector<std::pair<KeyType, ValueType>> Hyper::rangeQuery(KeyType left, KeyTy
                 KeyType key = leaf->decodeKey(slot.data.kv.key);
                 if (key >= left && key <= right) {
                     result.emplace_back(key, slot.data.kv.value);
+                    if (result.size() >= limit) {
+                        rightBoundaryHit = true;
+                        break;
+                    }
                 }
                 if (key > right) {
                     rightBoundaryHit = true;
                     break;
                 }
-            }
-                // Process overflow buffer
-            else if (slot.isPointer() && slot.data.overflowPtr) {
+            } else if (slot.isPointer() && slot.data.overflowPtr) {
                 const auto& buffer_data = slot.data.overflowPtr.load(std::memory_order_acquire)->data();
 
-                // Binary search for the lower bound in the overflow buffer
                 auto startIter = buffer_data.begin();
                 if (isFirstLeaf) {
                     startIter = std::lower_bound(buffer_data.begin(), buffer_data.end(), left,
@@ -602,6 +613,10 @@ std::vector<std::pair<KeyType, ValueType>> Hyper::rangeQuery(KeyType left, KeyTy
                 for (auto it = startIter; it != buffer_data.end(); ++it) {
                     if (it->first <= right) {
                         result.push_back(*it);
+                        if (result.size() >= limit) {
+                            rightBoundaryHit = true;
+                            break;
+                        }
                     } else {
                         rightBoundaryHit = true;
                         break;
@@ -796,7 +811,7 @@ std::vector<std::pair<KeyType, void*>> Hyper::buildLeaves(
 }
 
 void Hyper::rebuildModelNode(ModelInnerNode* modelNode, void* parentNode) {
-    std::unique_lock<std::mutex> parentLock;
+    std::unique_lock<HyperSlotMutex> parentLock;
 
     if (parentNode == nullptr) {
         // This is the root node - use RCU update instead of locking
@@ -835,12 +850,12 @@ void Hyper::rebuildModelNode(ModelInnerNode* modelNode, void* parentNode) {
         }
 
         if (found && isHyperLockingEnabled()) {
-            parentLock = std::unique_lock<std::mutex>(modelParent->getSlotLock(slotIdx));
+            parentLock = std::unique_lock<HyperSlotMutex>(modelParent->getSlotLock(slotIdx));
         }
     } else if (isSearchInnerNode(parentNode)) {
         auto* searchParent = taggedCast<SearchInnerNode>(parentNode);
         if (isHyperLockingEnabled()) {
-            parentLock = std::unique_lock<std::mutex>(searchParent->structural_lock_);
+            parentLock = std::unique_lock<HyperSlotMutex>(searchParent->structural_lock_);
         }
     }
 
@@ -882,7 +897,7 @@ void Hyper::collectAllData(void* node, std::vector<std::pair<KeyType, ValueType>
         std::set<void*> processedChildren;  // Avoid duplicates
 
         for (size_t i = 0; i < numSlots; i++) {
-            std::mutex& slotLock = modelNode->getSlotLock(i);
+            HyperSlotMutex& slotLock = modelNode->getSlotLock(i);
 
             if (slotLock.try_lock()) {
                 // Got the lock - can read safely
@@ -935,7 +950,7 @@ void Hyper::collectAllData(void* node, std::vector<std::pair<KeyType, ValueType>
 }
 
 void Hyper::convertSearchNodeToModelNode(SearchInnerNode* sNode, void* parentNode) {
-    std::unique_lock<std::mutex> parentLock;
+    std::unique_lock<HyperSlotMutex> parentLock;
     KeyType searchNodeKey = 0; // Will store the key for this search node in parent
 
     // Parent is a model inner node - find and lock the appropriate slot
@@ -954,7 +969,7 @@ void Hyper::convertSearchNodeToModelNode(SearchInnerNode* sNode, void* parentNod
     }
 
     if (isHyperLockingEnabled()) {
-        parentLock = std::unique_lock<std::mutex>(modelParent->getSlotLock(slotIdx));
+        parentLock = std::unique_lock<HyperSlotMutex>(modelParent->getSlotLock(slotIdx));
     }
 
     // Get the key for this search node (needed for updating parent)
