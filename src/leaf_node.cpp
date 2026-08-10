@@ -4,52 +4,49 @@
 #include "../include/leaf_node.h"
 #include "../include/epoch_manager.h"
 
-// --- Slot implementation ---
-LeafNode::Slot::Slot() {
-    data.overflowPtr.store(nullptr, std::memory_order_relaxed);
-}
+// --- Slot implementation (16B plain cells; locks live on the leaf) ---
+LeafNode::Slot::Slot() : key(0), overflowPtr(nullptr) {}
 
 LeafNode::Slot::~Slot() {
     destroy();
 }
 
 bool LeafNode::Slot::isEmpty() const {
-    return !isKV() && data.overflowPtr.load(std::memory_order_acquire) == nullptr;
+    return !isKV() && overflowPtr == nullptr;
 }
 
 bool LeafNode::Slot::isKV() const {
-    KeyType key = data.kv.key.load(std::memory_order_acquire);
     return (key & MSB_MASK) != 0;
 }
 
 bool LeafNode::Slot::isPointer() const {
-    return !isKV() && data.overflowPtr.load(std::memory_order_acquire) != nullptr;
+    return !isKV() && overflowPtr != nullptr;
 }
 
 void LeafNode::Slot::destroy() {
     if (isPointer()) {
-        OverflowBuffer* ptr = data.overflowPtr.load(std::memory_order_acquire);
+        OverflowBuffer* ptr = overflowPtr;
         if (ptr) {
             delete ptr;
-            data.overflowPtr.store(nullptr, std::memory_order_release);
+            overflowPtr = nullptr;
         }
     }
-    // Clear KV marker so the slot becomes empty (needed for erase of accurate slots).
-    data.kv.key.store(0, std::memory_order_release);
-    data.kv.value = 0;
+    key = 0;
+    value = 0;
 }
 
 void LeafNode::Slot::setSingle(KeyType k, ValueType v) {
-    data.kv.key.store(k | MSB_MASK, std::memory_order_release);  // Set MSB to indicate this is a key-value pair
-    data.kv.value = v;
+    key = k | MSB_MASK;
+    value = v;
 }
 
 void LeafNode::Slot::setOverflow(KeyType k, ValueType v) {
-    OverflowBuffer* current = data.overflowPtr.load(std::memory_order_acquire);
+    OverflowBuffer* current = overflowPtr;
     if (!current) {
         OverflowBuffer* newBuffer = new OverflowBuffer(4);
         newBuffer->bulk_load({{k, v}});
-        data.overflowPtr.store(newBuffer, std::memory_order_release);
+        key = 0;
+        overflowPtr = newBuffer;
         return;
     }
     if (!isHyperLockingEnabled()) {
@@ -57,7 +54,8 @@ void LeafNode::Slot::setOverflow(KeyType k, ValueType v) {
         return;
     }
     OverflowBuffer* newBuffer = current->insertRCU(k, v);
-    data.overflowPtr.store(newBuffer, std::memory_order_release);
+    key = 0;
+    overflowPtr = newBuffer;
     safeDelete(current);
 }
 
@@ -65,26 +63,33 @@ void LeafNode::Slot::setOverflow(KeyType k, ValueType v) {
 LeafNode::LeafNode(double slope, KeyType minKey, KeyType maxKey)
         : slope_(slope), minKey_(minKey), maxPossibleKey_(std::numeric_limits<KeyType>::max()),
           MR_(ceil(slope * static_cast<double>(maxKey - minKey))), slots_(MR_+1),
-          op_counter_ptr_(0), init_histogram_(MR_+1, 0) {}
+          op_counter_ptr_(0), init_histogram_(MR_+1, 0) {
+    if (isHyperLockingEnabled()) {
+        slot_locks_ = std::make_unique<HyperSlotMutex[]>(MR_ + 1);
+    }
+}
 
 LeafNode::LeafNode(const LeafNode& other)
         : slope_(other.slope_), minKey_(other.minKey_), maxPossibleKey_(other.maxPossibleKey_),
           MR_(other.MR_), slots_(other.MR_ + 1),
           op_counter_ptr_(other.op_counter_ptr_.load()), init_histogram_(other.init_histogram_) {
-
-    // Deep copy all slots (locks are initialized fresh)
+    if (isHyperLockingEnabled()) {
+        slot_locks_ = std::make_unique<HyperSlotMutex[]>(MR_ + 1);
+    }
+    // Deep copy all slots
     for (size_t i = 0; i < other.slots_.size(); ++i) {
         const auto& srcSlot = other.slots_[i];
         if (srcSlot.isKV()) {
-            KeyType key = srcSlot.data.kv.key.load(std::memory_order_acquire);
-            ValueType value = srcSlot.data.kv.value;
-            slots_[i].data.kv.key.store(key, std::memory_order_release);
-            slots_[i].data.kv.value = value;
+            KeyType key = srcSlot.key;
+            ValueType value = srcSlot.value;
+            slots_[i].key = key;
+            slots_[i].value = value;
         } else if (srcSlot.isPointer()) {
-            OverflowBuffer* srcBuffer = srcSlot.data.overflowPtr.load(std::memory_order_acquire);
+            OverflowBuffer* srcBuffer = srcSlot.overflowPtr;
             if (srcBuffer) {
                 OverflowBuffer* newBuffer = new OverflowBuffer(*srcBuffer);
-                slots_[i].data.overflowPtr.store(newBuffer, std::memory_order_release);
+                slots_[i].key = 0;
+                slots_[i].overflowPtr = newBuffer;
             }
         }
     }
@@ -101,7 +106,7 @@ size_t LeafNode::slotConflictCount(size_t idx) const {
     const auto& s = slots_[idx];
     if (s.isKV()) return 1;
     if (s.isPointer()) {
-        OverflowBuffer* buffer = s.data.overflowPtr.load(std::memory_order_acquire);
+        OverflowBuffer* buffer = s.overflowPtr;
         return buffer ? buffer->size() : 0;
     }
     return 0;
@@ -116,11 +121,12 @@ size_t LeafNode::maxConflictCount() const {
 }
 
 void LeafNode::overflowInsert(Slot& slot, KeyType key, ValueType value) {
-    OverflowBuffer* current = slot.data.overflowPtr.load(std::memory_order_acquire);
+    OverflowBuffer* current = slot.overflowPtr;
     if (!current) {
         OverflowBuffer* neu = new OverflowBuffer(4);
         neu->bulk_load({{key, value}});
-        slot.data.overflowPtr.store(neu, std::memory_order_release);
+        slot.key = 0;
+        slot.overflowPtr = neu;
         return;
     }
     if (!isHyperLockingEnabled()) {
@@ -128,25 +134,28 @@ void LeafNode::overflowInsert(Slot& slot, KeyType key, ValueType value) {
         return;
     }
     OverflowBuffer* neu = current->insertRCU(key, value);
-    slot.data.overflowPtr.store(neu, std::memory_order_release);
+    slot.key = 0;
+        slot.overflowPtr = neu;
     safeDelete(current);
 }
 
 bool LeafNode::overflowErase(Slot& slot, KeyType key) {
-    OverflowBuffer* current = slot.data.overflowPtr.load(std::memory_order_acquire);
+    OverflowBuffer* current = slot.overflowPtr;
     if (!current) return false;
 
     if (!isHyperLockingEnabled()) {
         if (!current->erase(key)) return false;
         if (current->size() == 0) {
             delete current;
-            slot.data.overflowPtr.store(nullptr, std::memory_order_release);
-            slot.data.kv.key.store(0, std::memory_order_release);
-            slot.data.kv.value = 0;
+            slot.overflowPtr = nullptr;
+            slot.key = 0;
+            slot.key = 0;
+            slot.value = 0;
         } else if (current->size() == 1) {
             auto only = current->data().front();
             delete current;
-            slot.data.overflowPtr.store(nullptr, std::memory_order_release);
+            slot.overflowPtr = nullptr;
+            slot.key = 0;
             slot.setSingle(only.first, only.second);
         }
         return true;
@@ -156,16 +165,19 @@ bool LeafNode::overflowErase(Slot& slot, KeyType key) {
     if (!neu) return false;
     if (neu->size() == 0) {
         delete neu;
-        slot.data.overflowPtr.store(nullptr, std::memory_order_release);
-        slot.data.kv.key.store(0, std::memory_order_release);
-        slot.data.kv.value = 0;
+        slot.overflowPtr = nullptr;
+            slot.key = 0;
+        slot.key = 0;
+        slot.value = 0;
     } else if (neu->size() == 1) {
         auto only = neu->data().front();
         delete neu;
-        slot.data.overflowPtr.store(nullptr, std::memory_order_release);
+        slot.overflowPtr = nullptr;
+            slot.key = 0;
         slot.setSingle(only.first, only.second);
     } else {
-        slot.data.overflowPtr.store(neu, std::memory_order_release);
+        slot.key = 0;
+        slot.overflowPtr = neu;
     }
     safeDelete(current);
     return true;
@@ -184,28 +196,29 @@ InsertReturn LeafNode::insert(
     size_t idx = predictSlot(key);
     bool needsSplit = false;
 
-    std::unique_lock<HyperSlotMutex> slotLock(slots_[idx].lock, std::defer_lock);
-    if (isHyperLockingEnabled()) {
-        slotLock.lock();
+    std::unique_lock<HyperSlotMutex> guard;
+    if (hasSlotLocks()) {
+        guard = std::unique_lock<HyperSlotMutex>(getSlotMutex(idx));
     }
     auto& slot = slots_[idx];
 
     if (slot.isEmpty()) {
         slot.setSingle(key, value);
     } else if (slot.isKV()) {
-        KeyType existingKey = decodeKey(slot.data.kv.key.load(std::memory_order_acquire));
-        ValueType existingValue = slot.data.kv.value;
+        KeyType existingKey = decodeKey(slot.key);
+        ValueType existingValue = slot.value;
         if (existingKey == key) {
-            slot.data.kv.value = value;
+            slot.value = value;
         } else {
             auto p0 = std::make_pair(existingKey, existingValue);
             auto p1 = std::make_pair(key, value);
             if (p1.first < p0.first) std::swap(p0, p1);
             // Clear KV tag before storing overflow pointer (union aliasing).
-            slot.data.kv.key.store(0, std::memory_order_relaxed);
+            slot.key = 0;
             OverflowBuffer* newBuffer = new OverflowBuffer(4);
             newBuffer->bulk_load({p0, p1});
-            slot.data.overflowPtr.store(newBuffer, std::memory_order_release);
+            slot.key = 0;
+            slot.overflowPtr = newBuffer;
         }
     } else {
         overflowInsert(slot, key, value);
@@ -219,8 +232,8 @@ InsertReturn LeafNode::insert(
     // Policy 1: try cheap in-place retrain when C^max_leaf is exceeded.
     bool needsRetrain = !needsSplit && conflicts >= kMaxLeafConflicts;
 
-    if (slotLock.owns_lock()) {
-        slotLock.unlock();
+    if (guard.owns_lock()) {
+        guard.unlock();
     }
 
     // Policy 2: 16-bit counter in pointer word; wrap triggers KS check.
@@ -283,16 +296,16 @@ std::optional<ValueType> LeafNode::find(KeyType key) const {
     // Lock-free read - use atomic loads for consistency
     if (slot.isPointer()) {
         // Key is in an overflow buffer - search there
-        OverflowBuffer* buffer = slot.data.overflowPtr.load(std::memory_order_acquire);
+        OverflowBuffer* buffer = slot.overflowPtr;
         if (buffer) {
             return buffer->find(key);
         }
         return std::nullopt;
     } else if (slot.isKV()) {
         // Slot contains a direct key-value pair
-        KeyType stored_key = decodeKey(slot.data.kv.key.load(std::memory_order_acquire));
+        KeyType stored_key = decodeKey(slot.key);
         if (stored_key == key) {
-            return slot.data.kv.value;
+            return slot.value;
         }
         return std::nullopt;
     } else {
@@ -304,12 +317,15 @@ std::optional<ValueType> LeafNode::find(KeyType key) const {
 bool LeafNode::erase(KeyType key) {
     size_t idx = predictSlot(key);
     auto& slot = slots_[idx];
-    MaybeLock slotLock(slot.lock);
+    std::unique_lock<HyperSlotMutex> guard;
+    if (hasSlotLocks()) {
+        guard = std::unique_lock<HyperSlotMutex>(getSlotMutex(idx));
+    }
 
     // Paper §4.4: deleting the leftmost key must not change minKey_ metadata.
 
     if (!slot.isPointer() && slot.isKV()) {
-        KeyType original_key = decodeKey(slot.data.kv.key.load(std::memory_order_acquire));
+        KeyType original_key = decodeKey(slot.key);
         if (original_key == key) {
             slot.destroy();
             return true;
@@ -326,23 +342,27 @@ bool LeafNode::update(KeyType key, ValueType value) {
     if (key > maxPossibleKey_) return false;
     size_t idx = predictSlot(key);
     auto& slot = slots_[idx];
-    MaybeLock slotLock(slot.lock);
+    std::unique_lock<HyperSlotMutex> guard;
+    if (hasSlotLocks()) {
+        guard = std::unique_lock<HyperSlotMutex>(getSlotMutex(idx));
+    }
 
     if (slot.isKV()) {
-        KeyType original_key = decodeKey(slot.data.kv.key.load(std::memory_order_acquire));
+        KeyType original_key = decodeKey(slot.key);
         if (original_key != key) return false;
-        slot.data.kv.value = value;
+        slot.value = value;
         return true;
     }
     if (slot.isPointer()) {
-        OverflowBuffer* buf = slot.data.overflowPtr.load(std::memory_order_acquire);
+        OverflowBuffer* buf = slot.overflowPtr;
         if (!buf || !buf->find(key).has_value()) return false;
         if (!isHyperLockingEnabled()) {
             buf->insert(key, value);
             return true;
         }
         OverflowBuffer* neu = buf->insertRCU(key, value);
-        slot.data.overflowPtr.store(neu, std::memory_order_release);
+        slot.key = 0;
+        slot.overflowPtr = neu;
         safeDelete(buf);
         return true;
     }
@@ -355,7 +375,7 @@ size_t LeafNode::size() const {
         if (slot.isKV()) {
             ++n;
         } else if (slot.isPointer()) {
-            OverflowBuffer* buffer = slot.data.overflowPtr.load(std::memory_order_acquire);
+            OverflowBuffer* buffer = slot.overflowPtr;
             if (buffer) n += buffer->size();
         }
     }
@@ -384,10 +404,11 @@ bool LeafNode::maybeRebuildLowDensity(double min_density) {
 size_t LeafNode::memoryBytes() const {
     size_t bytes = sizeof(LeafNode);
     bytes += slots_.capacity() * sizeof(Slot);
-    bytes += init_histogram_.capacity() * sizeof(int);
+    bytes += init_histogram_.capacity() * sizeof(uint16_t);
+    if (slot_locks_) bytes += (MR_ + 1) * sizeof(HyperSlotMutex);
     for (const auto& slot : slots_) {
         if (slot.isPointer()) {
-            OverflowBuffer* buffer = slot.data.overflowPtr.load(std::memory_order_acquire);
+            OverflowBuffer* buffer = slot.overflowPtr;
             if (buffer) {
                 bytes += sizeof(OverflowBuffer);
                 bytes += buffer->size() * sizeof(std::pair<KeyType, ValueType>);
@@ -429,9 +450,10 @@ void LeafNode::bulkLoad(std::vector<std::pair<KeyType, ValueType>>&& data) {
         } else {
             // Use overflow buffer for multiple key-value pairs
             OverflowBuffer* buffer = new OverflowBuffer(group.size());
-            init_histogram_[idx] = group.size();
+            init_histogram_[idx] = static_cast<uint16_t>(std::min(group.size(), size_t(65535)));
             buffer->bulk_load(std::move(group));
-            slots_[idx].data.overflowPtr.store(buffer, std::memory_order_release);
+            slots_[idx].key = 0;
+            slots_[idx].overflowPtr = buffer;
         }
     }
 }
@@ -443,7 +465,7 @@ std::vector<std::pair<KeyType, ValueType>> LeafNode::gatherAll() const {
         if (s.isKV())
             total += 1;
         else if (s.isPointer()) {
-            OverflowBuffer* buffer = s.data.overflowPtr.load(std::memory_order_acquire);
+            OverflowBuffer* buffer = s.overflowPtr;
             if (buffer) total += buffer->size();
         }
     }
@@ -454,9 +476,9 @@ std::vector<std::pair<KeyType, ValueType>> LeafNode::gatherAll() const {
 
     for (const auto& s : slots_) {
         if (s.isKV()) {
-            all.emplace_back(decodeKey(s.data.kv.key.load(std::memory_order_acquire)), s.data.kv.value);
+            all.emplace_back(decodeKey(s.key), s.value);
         } else if (s.isPointer()) {
-            OverflowBuffer* buffer = s.data.overflowPtr.load(std::memory_order_acquire);
+            OverflowBuffer* buffer = s.overflowPtr;
             if (buffer) {
                 const auto& vec = buffer->data();
                 all.insert(all.end(), vec.begin(), vec.end());
@@ -500,12 +522,11 @@ std::optional<std::vector<std::pair<KeyType, void*>>> LeafNode::performSplitWith
 }
 
 bool LeafNode::hasAnySlotLocked() const {
-    for (const auto& slot : slots_) {
-        if (slot.lock.try_lock()) {
-            // Could acquire lock, so it wasn't locked, unlock immediately
-            slot.lock.unlock();
+    if (!hasSlotLocks()) return false;
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        if (getSlotMutex(i).try_lock()) {
+            getSlotMutex(i).unlock();
         } else {
-            // Couldn't acquire lock, so it's locked by another thread
             return true;
         }
     }
@@ -514,10 +535,11 @@ bool LeafNode::hasAnySlotLocked() const {
 
 std::vector<std::unique_lock<HyperSlotMutex>> LeafNode::tryLockAllSlots() {
     std::vector<std::unique_lock<HyperSlotMutex>> locks;
+    if (!hasSlotLocks()) return locks;
     locks.reserve(slots_.size());
 
-    for (auto& slot : slots_) {
-        std::unique_lock<HyperSlotMutex> lock(slot.lock, std::try_to_lock);
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        std::unique_lock<HyperSlotMutex> lock(getSlotMutex(i), std::try_to_lock);
         if (!lock.owns_lock()) {
             locks.clear();
             return locks;
@@ -646,7 +668,7 @@ bool LeafNode::checkPolicyTwo() {
         if (s.isKV())
             count = 1;
         else if (s.isPointer()) {
-            OverflowBuffer *buffer = s.data.overflowPtr.load(std::memory_order_acquire);
+            OverflowBuffer *buffer = s.overflowPtr;
             if (buffer) count = buffer->size();
         }
         current_hist[i] = count;

@@ -18,6 +18,12 @@ SearchInnerNode::~SearchInnerNode() {
     children_.clear();
 }
 
+void SearchInnerNode::disownChildren() {
+    for (auto& entry : children_) {
+        entry.childPtr = nullptr;
+    }
+}
+
 void SearchInnerNode::addChild(KeyType boundaryKey, void* child) {
     std::unique_lock<HyperSlotMutex> guard(structural_lock_, std::defer_lock);
     if (isHyperLockingEnabled()) {

@@ -111,6 +111,7 @@ public:
          * @brief Begins a write operation by incrementing version to odd number
          */
         void beginWrite() {
+            if (!isHyperLockingEnabled()) return;
             version.fetch_add(1, std::memory_order_release);
         }
 
@@ -118,6 +119,7 @@ public:
          * @brief Ends a write operation by incrementing version to even number
          */
         void endWrite() {
+            if (!isHyperLockingEnabled()) return;
             version.fetch_add(1, std::memory_order_release);
         }
     };
@@ -210,6 +212,18 @@ public:
      * @return true if a rebuild is recommended, false otherwise
      */
     bool shouldRebuild() const;
+
+    /**
+     * @brief Collect unique real children as (boundaryKey, taggedPtr), sorted by key.
+     *        Used for paper §3.3.2 M-inner rebuild (no leaf data rewrite).
+     */
+    std::vector<std::pair<KeyType, void*>> collectSortedChildren() const;
+
+    /**
+     * @brief Null out child pointers so the destructor does not free the subtree.
+     *        Call after children have been re-parented under a replacement node.
+     */
+    void disownChildren();
 
     /**
      * @brief Gets all slots in the node for efficient rebuilding

@@ -5,6 +5,8 @@
 #include "hyper_index.h"
 #include <cassert>
 #include <cmath>
+#include <cstdint>
+#include <memory>
 #include <vector>
 #include <optional>
 #include <mutex>
@@ -64,60 +66,24 @@ public:
      * or a pointer to an overflow buffer, with its own mutex for concurrency control.
      */
     struct Slot {
-        /**
-         * @union SlotData
-         * @brief Union to store either a key-value pair or a pointer to an overflow buffer.
-         */
-        union SlotData {
-            struct {
-                std::atomic<KeyType> key;     // Key with MSB set to 1
-                ValueType value; // Associated value
-            } kv;
-            std::atomic<OverflowBuffer*> overflowPtr; // Pointer to overflow buffer with MSB of 0
-        } data;
-
-        mutable HyperSlotMutex lock;  // Allocated only when locking enabled
+        // Paper-like 16B cell: MSB of key marks KV; else overflow ptr / empty.
+        KeyType key = 0;
+        union {
+            ValueType value;
+            OverflowBuffer* overflowPtr;
+        };
 
         Slot();
         ~Slot();
 
-        /**
-         * @brief Destroys the slot content properly based on its type
-         */
         void destroy();
-
-        /**
-         * @brief Sets the slot to contain a single key-value pair
-         * @param k Key to store
-         * @param v Value to store
-         */
         void setSingle(KeyType k, ValueType v);
-
-        /**
-         * @brief Creates an overflow buffer and adds the key-value pair
-         * @param k Key to store
-         * @param v Value to store
-         */
         void setOverflow(KeyType k, ValueType v);
-
-        /**
-         * @brief Checks if the slot contains a key-value pair
-         * @return true if the slot contains a key-value pair, false otherwise
-         */
         bool isKV() const;
-
-        /**
-         * @brief Checks if the slot contains a pointer to an overflow buffer
-         * @return true if the slot contains a pointer, false otherwise
-         */
         bool isPointer() const;
-
-        /**
-         * @brief Checks if the slot is empty
-         * @return true if the slot is empty, false otherwise
-         */
         bool isEmpty() const;
     };
+    static_assert(sizeof(Slot) == 16, "Leaf slot must be 16 bytes");
 
     /**
      * @brief Constructs a leaf node with a linear model for key placement
@@ -327,11 +293,18 @@ private:
     KeyType minKey_;                 // Minimum key in the node
     KeyType maxPossibleKey_;         // Maximum possible key for this node
     std::vector<Slot> slots_;        // Array of slots for storing data
+    // Side array: only allocated when locking is enabled (ST has zero lock footprint).
+    std::unique_ptr<HyperSlotMutex[]> slot_locks_;
+
+    HyperSlotMutex& getSlotMutex(size_t idx) const {
+        return slot_locks_[idx];
+    }
+    bool hasSlotLocks() const { return static_cast<bool>(slot_locks_); }
 
     // Paper §3.3.1: 16-bit op counter packed in the high bits of a pointer word.
     static constexpr unsigned kOpCounterShift = 48;
     std::atomic<uintptr_t> op_counter_ptr_{0};
-    std::vector<int> init_histogram_; // Initial key distribution histogram
+    std::vector<uint16_t> init_histogram_; // Initial key distribution histogram
 
     // Held from leaf split gather through parent descriptor install (MT).
     std::mutex smo_lock_;

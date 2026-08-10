@@ -1,4 +1,6 @@
 #include "../include/model_inner_node.h"
+#include <algorithm>
+#include <set>
 #include <thread>
 #include "../include/epoch_manager.h"
 
@@ -17,29 +19,36 @@ ModelInnerNode::~ModelInnerNode() {
 }
 
 bool ModelInnerNode::readSlotSeqLock(size_t idx, KeyType& key, void*& child, bool& isReal) const {
-    uint64_t version_before, version_after;
-
-    do {
-        // Read version before accessing data
-        version_before = slots_[idx].version.load(std::memory_order_acquire);
-
-        // If version is odd, a writer is active - retry
-        if (version_before & 1) {
-            continue;
-        }
-
-        // Read slot data
+    // ST unlocked path: plain read (no seqlock atomics).
+    if (!isHyperLockingEnabled()) {
         isReal = slots_[idx].isRealChild();
         if (isReal) {
             key = slots_[idx].KeyChildPtr.first;
             child = slots_[idx].KeyChildPtr.second;
         } else {
-            // For duplicate slots, we have the direct child pointer
-            key = 0; // Not used for duplicates
+            key = 0;
+            child = slots_[idx].getChildPtr();
+        }
+        return true;
+    }
+
+    uint64_t version_before, version_after;
+
+    do {
+        version_before = slots_[idx].version.load(std::memory_order_acquire);
+        if (version_before & 1) {
+            continue;
+        }
+
+        isReal = slots_[idx].isRealChild();
+        if (isReal) {
+            key = slots_[idx].KeyChildPtr.first;
+            child = slots_[idx].KeyChildPtr.second;
+        } else {
+            key = 0;
             child = slots_[idx].getChildPtr();
         }
 
-        // Read version after accessing data
         version_after = slots_[idx].version.load(std::memory_order_acquire);
 
     } while (version_before != version_after || (version_before & 1));
@@ -87,9 +96,8 @@ void ModelInnerNode::updateSlotDuplicateSeqLock(size_t idx, void* childPtr) {
 }
 
 void* ModelInnerNode::findChild(KeyType key) const {
-    // Predict, correct one slot left if needed, then walk right while the next
-    // real child's boundary is still <= key. Needed when the model lands in a
-    // predecessor's duplicate region past a later child's min key (Fig. 6 + dups).
+    // Paper Fig. 6: model predict; if predicted key > query take left neighbor;
+    // otherwise take this child (duplicates already store the predecessor ptr).
     size_t idx = predictSlot(key);
 
     KeyType slotKey;
@@ -99,27 +107,7 @@ void* ModelInnerNode::findChild(KeyType key) const {
     readSlotSeqLock(idx, slotKey, slotChild, isReal);
 
     if (isReal && slotKey > key && idx > 0) {
-        idx--;
-        readSlotSeqLock(idx, slotKey, slotChild, isReal);
-    }
-
-    while (true) {
-        size_t next = idx + 1;
-        KeyType nextKey = 0;
-        void* nextChild = nullptr;
-        bool nextReal = false;
-        while (next < slots_.size()) {
-            readSlotSeqLock(next, nextKey, nextChild, nextReal);
-            if (nextReal) break;
-            ++next;
-        }
-        if (next >= slots_.size() || !nextReal || nextKey > key) {
-            break;
-        }
-        idx = next;
-        slotKey = nextKey;
-        slotChild = nextChild;
-        isReal = true;
+        readSlotSeqLock(idx - 1, slotKey, slotChild, isReal);
     }
 
     return slotChild;
@@ -482,27 +470,7 @@ std::tuple<std::unique_lock<HyperSlotMutex>, void*, size_t> ModelInnerNode::find
         readSlotSeqLock(idx, slotKey, slotChild, isReal);
     }
 
-    while (true) {
-        size_t next = idx + 1;
-        KeyType nextKey = 0;
-        void* nextChild = nullptr;
-        bool nextReal = false;
-        while (next < slots_.size()) {
-            readSlotSeqLock(next, nextKey, nextChild, nextReal);
-            if (nextReal) break;
-            ++next;
-        }
-        if (next >= slots_.size() || !nextReal || nextKey > key) {
-            break;
-        }
-        idx = next;
-        slotKey = nextKey;
-        slotChild = nextChild;
-        isReal = true;
-    }
-
     size_t finalSlotIdx = idx;
-    // Lock the owning real slot when we landed on a duplicate.
     if (!isReal) {
         void* targetChild = slotChild;
         for (size_t i = 0; i < slots_.size(); i++) {
@@ -574,6 +542,34 @@ bool ModelInnerNode::shouldRebuild() const {
     size_t init = initial_leaf_node_count_.load(std::memory_order_relaxed);
     // Paper §3.3.2: rebuild M-inner when leaf count doubles.
     return init > 0 && curr >= 2 * init;
+}
+
+std::vector<std::pair<KeyType, void*>> ModelInnerNode::collectSortedChildren() const {
+    std::vector<std::pair<KeyType, void*>> children;
+    children.reserve(slots_.size());
+    std::set<void*> seen;
+    for (const auto& slot : slots_) {
+        if (!slot.isRealChild()) continue;
+        void* child = slot.KeyChildPtr.second;
+        if (!child || !seen.insert(child).second) continue;
+        children.emplace_back(slot.KeyChildPtr.first, child);
+    }
+    std::sort(children.begin(), children.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    return children;
+}
+
+void ModelInnerNode::disownChildren() {
+    for (auto& slot : slots_) {
+        if (slot.isRealChild()) {
+            slot.KeyChildPtr.second = nullptr;
+            slot.KeyChildPtr.~pair();
+            slot.setDuplicate(nullptr);
+        } else {
+            slot.setDuplicate(nullptr);
+        }
+    }
+    leaf_node_count_.store(0, std::memory_order_relaxed);
 }
 
 void ModelInnerNode::deleteChildNode(void* childPtr) {

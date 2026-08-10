@@ -120,7 +120,7 @@ std::optional<ValueType> Hyper::findOnce(KeyType key, bool allow_retry) const {
 }
 
 bool Hyper::erase(KeyType key) {
-    EpochManager::Guard guard;
+    EPOCH_GUARD();
 
     void* cur = root_.load(std::memory_order_acquire);
     if (cur == nullptr) {
@@ -152,7 +152,7 @@ bool Hyper::erase(KeyType key) {
 }
 
 bool Hyper::update(KeyType key, ValueType value) {
-    EpochManager::Guard guard;
+    EPOCH_GUARD();
 
     void* cur = root_.load(std::memory_order_acquire);
     if (cur == nullptr) return false;
@@ -220,8 +220,8 @@ void* Hyper::buildInnerFromChildren(std::vector<std::pair<KeyType, void*>>& chil
 }
 
 void Hyper::insert(KeyType key, ValueType value) {
-    EpochManager::Guard guard; // Protect the entire insert operation
-    
+    EPOCH_GUARD();
+
     // Initialize the index with a single leaf node if empty
     void* currentRoot = root_.load(std::memory_order_acquire);
     if (currentRoot == nullptr) {
@@ -285,19 +285,11 @@ void Hyper::insert(KeyType key, ValueType value) {
     for (int attempt = 0; attempt < MAX_INSERT_RETRIES; ++attempt) {
         InsertResult result = insertAttempt(key, value);
         if (result != InsertResult::RetryFromRoot) {
-            if (attempt > 0) {
-                std::cout << "Insert succeeded after " << (attempt + 1) << " attempts for key " << key << std::endl;
-            }
             return;
         }
-        
-        if (attempt >= 3) {
-            std::cout << "Insert retry " << (attempt + 1) << " for key " << key 
-                      << " (outdated node encountered)" << std::endl;
-        }
-        
-        if (attempt < MAX_INSERT_RETRIES - 1) {
-            std::this_thread::sleep_for(std::chrono::microseconds(1 << std::min(attempt, 10)));
+        // ST: no backoff sleep; MT: brief yield only.
+        if (attempt < MAX_INSERT_RETRIES - 1 && isHyperLockingEnabled()) {
+            std::this_thread::yield();
         }
     }
     
@@ -589,16 +581,16 @@ std::vector<std::pair<KeyType, ValueType>> Hyper::rangeQuery(KeyType left, KeyTy
             const auto& slot = leaf->getSlots()[i];
 
             if (slot.isKV()) {
-                KeyType key = leaf->decodeKey(slot.data.kv.key);
+                KeyType key = leaf->decodeKey(slot.key);
                 if (key >= left && key <= right) {
-                    leaf_hits.emplace_back(key, slot.data.kv.value);
+                    leaf_hits.emplace_back(key, slot.value);
                 }
                 if (key > right) {
                     past_right = true;
                     break;
                 }
-            } else if (slot.isPointer() && slot.data.overflowPtr) {
-                OverflowBuffer* buf = slot.data.overflowPtr.load(std::memory_order_acquire);
+            } else if (slot.isPointer() && slot.overflowPtr) {
+                OverflowBuffer* buf = slot.overflowPtr;
                 if (!buf) continue;
                 const auto& buffer_data = buf->data();
                 auto startIter = std::lower_bound(
@@ -814,73 +806,66 @@ std::vector<std::pair<KeyType, void*>> Hyper::buildLeaves(
 }
 
 void Hyper::rebuildModelNode(ModelInnerNode* modelNode, void* parentNode) {
+    // Paper §3.3.2: rebuild the M-inner from child leftmost keys — do not
+    // rewrite leaves via collectAllData + PLA.
+    auto children = modelNode->collectSortedChildren();
+    if (children.empty()) return;
+    KeyType boundary = children.front().first;
+    void* taggedNew = buildInnerFromChildren(children);
+
+    auto abandonNewInner = [&](void* node) {
+        // Newly allocated inner points at the same children as the old node.
+        if (isModelInnerNode(node)) {
+            taggedCast<ModelInnerNode>(node)->disownChildren();
+            delete taggedCast<ModelInnerNode>(node);
+        } else if (isSearchInnerNode(node)) {
+            taggedCast<SearchInnerNode>(node)->disownChildren();
+            delete taggedCast<SearchInnerNode>(node);
+        }
+        // If buildInner returned an existing leaf (single child), leave it alone.
+    };
+
     std::unique_lock<HyperSlotMutex> parentLock;
 
     if (parentNode == nullptr) {
-        // This is the root node - use RCU update instead of locking
         void* oldRoot = tagPointer(modelNode, NodeType::ModelInner);
-        
-        // Collect all data from the model node subtree
-        std::vector<std::pair<KeyType, ValueType>> allData;
-        collectAllData(oldRoot, allData);
-
-        std::vector<std::pair<KeyType, void*>> newLeaves = buildLeaves(std::move(allData));
-        if (newLeaves.empty()) return;
-        void* taggedNewModelNode = buildInnerFromChildren(newLeaves);
-
-        if (!updateRootRCU(oldRoot, taggedNewModelNode)) {
-            // Root changed; orphaned rebuild tree is abandoned (retry path).
+        if (!updateRootRCU(oldRoot, taggedNew)) {
+            abandonNewInner(taggedNew);
             return;
         }
+        modelNode->disownChildren();
+        safeDelete(modelNode);
         return;
-        
-    } else if (isModelInnerNode(parentNode)) {
-        // Parent is a model inner node - find and lock the appropriate slot
-        auto* modelParent = taggedCast<ModelInnerNode>(parentNode);
+    }
 
-        // Find which slot contains this model node
+    if (isModelInnerNode(parentNode)) {
+        auto* modelParent = taggedCast<ModelInnerNode>(parentNode);
         size_t slotIdx = 0;
         bool found = false;
         void* taggedModelNode = tagPointer(modelNode, NodeType::ModelInner);
-
         for (size_t i = 0; i < modelParent->getNumSlots(); i++) {
-            void* child = modelParent->getChildAtIndex(i);
-            if (child == taggedModelNode) {
+            if (modelParent->getChildAtIndex(i) == taggedModelNode) {
                 slotIdx = i;
                 found = true;
                 break;
             }
         }
-
         if (found && isHyperLockingEnabled()) {
             parentLock = std::unique_lock<HyperSlotMutex>(modelParent->getSlotLock(slotIdx));
         }
+        modelParent->updateChildWithExternalLock(boundary, taggedNew);
     } else if (isSearchInnerNode(parentNode)) {
         auto* searchParent = taggedCast<SearchInnerNode>(parentNode);
         if (isHyperLockingEnabled()) {
             parentLock = std::unique_lock<HyperSlotMutex>(searchParent->structural_lock_);
         }
+        searchParent->addChild(boundary, taggedNew);
+    } else {
+        abandonNewInner(taggedNew);
+        return;
     }
 
-    std::vector<std::pair<KeyType, ValueType>> allData;
-    collectAllData(tagPointer(modelNode, NodeType::ModelInner), allData);
-
-    std::vector<std::pair<KeyType, void*>> newLeaves = buildLeaves(std::move(allData));
-    if (newLeaves.empty()) return;
-    KeyType boundary = newLeaves.front().first;
-    void* taggedNewModelNode = buildInnerFromChildren(newLeaves);
-
-    // Update parent based on parent type (non-root cases)
-    if (isModelInnerNode(parentNode)) {
-        auto* modelParent = taggedCast<ModelInnerNode>(parentNode);
-        modelParent->updateChildWithExternalLock(boundary, taggedNewModelNode);
-    } else if (isSearchInnerNode(parentNode)) {
-        // Parent is a search inner node - replace the child
-        auto* searchParent = taggedCast<SearchInnerNode>(parentNode);
-        searchParent->addChild(boundary, taggedNewModelNode);
-    }
-
-    // Clean up old model node using safe deletion
+    modelNode->disownChildren();
     safeDelete(modelNode);
 }
 

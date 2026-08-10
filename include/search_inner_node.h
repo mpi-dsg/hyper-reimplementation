@@ -113,6 +113,11 @@ public:
     std::pair<std::mutex*, void*> getSlotLockAndChild(int idx);
 
     /**
+     * @brief Null out child pointers so the destructor does not free the subtree.
+     */
+    void disownChildren();
+
+    /**
      * @brief Gets the version counter for consistent reads
      * @return Current version
      */

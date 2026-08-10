@@ -63,8 +63,9 @@ public:
 
         // Exponential search phase
         for (size_t i = 0; i < search_iter; ++i) {
-            // Calculate model range based on current slope
-            size_t mr = std::min(over_sub_factor, (size_t)ceil(best_slope * max_diff));
+            // Eq. 3: MR must be paired with the candidate slope under evaluation.
+            size_t mr = std::min(over_sub_factor, (size_t)ceil(slope * max_diff));
+            if (mr == 0) mr = 1;
 
             // Evaluate the cost of the current configuration
             auto [cost, slot_counts] = compute_cost(slope, mr);

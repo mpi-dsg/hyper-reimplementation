@@ -178,4 +178,19 @@ void safeDelete(T* ptr) {
     EpochManager::get().safeDelete(ptr);
 }
 
+// ST unlocked eval: skip epoch enter/exit atomics on the op path.
+#define EPOCH_GUARD()                                                          \
+    struct _HyperEpochMaybeGuard {                                             \
+        bool active_;                                                          \
+        _HyperEpochMaybeGuard() : active_(isHyperLockingEnabled()) {           \
+            if (active_) EpochManager::get().enterEpoch();                     \
+        }                                                                      \
+        ~_HyperEpochMaybeGuard() {                                             \
+            if (active_) EpochManager::get().exitEpoch();                      \
+        }                                                                      \
+    } _epoch_guard
+
+#ifdef EPOCH_GUARD_FORCE
+#undef EPOCH_GUARD
 #define EPOCH_GUARD() EpochManager::Guard _epoch_guard
+#endif
