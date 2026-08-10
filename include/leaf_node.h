@@ -157,8 +157,34 @@ public:
      * @brief Remove a key-value pair from the leaf node
      * @param key Key to erase
      * @return true if the key was found and removed, false otherwise
+     *
+     * Per Hyper §4.4: if @p key equals the leaf's leftmost key metadata
+     * (minKey_), the KV is removed but minKey_ is left unchanged to avoid
+     * frequent retraining.
      */
     bool erase(KeyType key);
+
+    /**
+     * @brief Number of live key-value pairs in this leaf (including overflows)
+     */
+    size_t size() const;
+
+    /**
+     * @brief Slot capacity of this leaf (MR_ + 1)
+     */
+    size_t capacity() const { return slots_.size(); }
+
+    /**
+     * @brief Fill ratio size()/capacity()
+     */
+    double density() const;
+
+    /**
+     * @brief If density falls below @p min_density, rebuild in place from
+     *        gatherAll() (Hyper §4.4 low-density rebuild).
+     * @return true if a rebuild ran
+     */
+    bool maybeRebuildLowDensity(double min_density);
 
     /**
      * @brief Load multiple key-value pairs into the leaf node

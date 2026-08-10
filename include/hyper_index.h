@@ -73,6 +73,21 @@ public:
     void insert(KeyType key, ValueType value);
 
     /**
+     * @brief Deletes a key from the index (Hyper paper §4.4).
+     *
+     * Locates the leaf, removes the entry, leaves leftmost-key metadata
+     * unchanged when the deleted key was the leaf minimum, and rebuilds the
+     * leaf in place if its density falls below @ref kMinLeafDensity.
+     *
+     * @param key Key to delete
+     * @return true if the key was present and removed
+     */
+    bool erase(KeyType key);
+
+    /// Lower density ratio that triggers an in-leaf rebuild after delete (§4.4).
+    static constexpr double kMinLeafDensity = 0.25;
+
+    /**
      * @brief Inserts multiple leaf node descriptors into the index
      * @param leafDescs Vector of key-leaf pairs to insert
      */

@@ -32,6 +32,9 @@ void LeafNode::Slot::destroy() {
             data.overflowPtr.store(nullptr, std::memory_order_release);
         }
     }
+    // Clear KV marker so the slot becomes empty (needed for erase of accurate slots).
+    data.kv.key.store(0, std::memory_order_release);
+    data.kv.value = 0;
 }
 
 void LeafNode::Slot::setSingle(KeyType k, ValueType v) {
@@ -201,6 +204,9 @@ bool LeafNode::erase(KeyType key) {
     // Lock the specific slot for erase operation
     std::lock_guard<std::mutex> slotLock(slot.lock);
 
+    // Paper §4.4: deleting the leftmost key must not change minKey_ metadata.
+    // minKey_ is intentionally left untouched below.
+
     if (!slot.isPointer() && slot.isKV()) {
         KeyType original_key = decodeKey(slot.data.kv.key.load(std::memory_order_acquire));
         if (original_key == key) {
@@ -213,7 +219,21 @@ bool LeafNode::erase(KeyType key) {
         if (current) {
             OverflowBuffer* newBuffer = current->eraseRCU(key);
             if (newBuffer) {
-                slot.data.overflowPtr.store(newBuffer, std::memory_order_release);
+                if (newBuffer->size() == 0) {
+                    // Empty overflow → clear slot
+                    delete newBuffer;
+                    slot.data.overflowPtr.store(nullptr, std::memory_order_release);
+                    slot.data.kv.key.store(0, std::memory_order_release);
+                    slot.data.kv.value = 0;
+                } else if (newBuffer->size() == 1) {
+                    // Collapse singleton overflow back to an accurate slot
+                    auto only = newBuffer->data().front();
+                    delete newBuffer;
+                    slot.data.overflowPtr.store(nullptr, std::memory_order_release);
+                    slot.setSingle(only.first, only.second);
+                } else {
+                    slot.data.overflowPtr.store(newBuffer, std::memory_order_release);
+                }
                 // Schedule old buffer for safe deletion
                 safeDelete(current);
                 return true;
@@ -221,6 +241,38 @@ bool LeafNode::erase(KeyType key) {
         }
     }
     return false;
+}
+
+size_t LeafNode::size() const {
+    size_t n = 0;
+    for (const auto& slot : slots_) {
+        if (slot.isKV()) {
+            ++n;
+        } else if (slot.isPointer()) {
+            OverflowBuffer* buffer = slot.data.overflowPtr.load(std::memory_order_acquire);
+            if (buffer) n += buffer->size();
+        }
+    }
+    return n;
+}
+
+double LeafNode::density() const {
+    size_t cap = capacity();
+    if (cap == 0) return 0.0;
+    return static_cast<double>(size()) / static_cast<double>(cap);
+}
+
+bool LeafNode::maybeRebuildLowDensity(double min_density) {
+    if (density() >= min_density) return false;
+    auto data = gatherAll();
+    if (data.empty()) return false;
+
+    // Rebuild in place: clear slots then bulk-load. Keeps slope_/minKey_/MR_.
+    for (auto& slot : slots_) {
+        slot.destroy();
+    }
+    bulkLoad(std::move(data));
+    return true;
 }
 
 void LeafNode::bulkLoad(std::vector<std::pair<KeyType, ValueType>>&& data) {

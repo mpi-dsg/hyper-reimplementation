@@ -29,3 +29,20 @@ if(OpenMP_CXX_FOUND)
     target_compile_options(HyperCode PUBLIC ${OpenMP_CXX_FLAGS})
     target_link_options(HyperCode PUBLIC ${OpenMP_CXX_FLAGS})
 endif()
+
+# Unit / smoke tests for paper-disclosed algorithms
+set(HYPER_LIB_SOURCES
+        src/hyper_index.cpp
+        src/leaf_node.cpp
+        src/model_inner_node.cpp
+        src/search_inner_node.cpp
+        src/overflow_buffer.cpp
+)
+
+add_executable(test_paper_delete tests/test_paper_delete.cpp ${HYPER_LIB_SOURCES})
+if(OpenMP_CXX_FOUND)
+    target_compile_options(test_paper_delete PUBLIC ${OpenMP_CXX_FLAGS})
+    target_link_options(test_paper_delete PUBLIC ${OpenMP_CXX_FLAGS})
+endif()
+enable_testing()
+add_test(NAME paper_delete COMMAND test_paper_delete)

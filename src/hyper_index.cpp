@@ -141,6 +141,38 @@ std::optional<ValueType> Hyper::find(KeyType key) const {
     return result;
 }
 
+bool Hyper::erase(KeyType key) {
+    EpochManager::Guard guard;
+
+    void* cur = root_.load(std::memory_order_acquire);
+    if (cur == nullptr) {
+        return false;
+    }
+
+    // Traverse to the responsible leaf (same shape as find).
+    while (!isLeafNode(cur)) {
+        if (isModelInnerNode(cur)) {
+            cur = taggedCast<ModelInnerNode>(cur)->findChild(key);
+        } else if (isSearchInnerNode(cur)) {
+            cur = taggedCast<SearchInnerNode>(cur)->findChild(key);
+        } else {
+            return false;
+        }
+        if (cur == nullptr) {
+            return false;
+        }
+    }
+
+    auto* leaf = taggedCast<LeafNode>(cur);
+    if (!leaf->erase(key)) {
+        return false;
+    }
+
+    // §4.4: rebuild leaf when density drops below the lower ratio.
+    leaf->maybeRebuildLowDensity(kMinLeafDensity);
+    return true;
+}
+
 void Hyper::insert(KeyType key, ValueType value) {
     EpochManager::Guard guard; // Protect the entire insert operation
     
