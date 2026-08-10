@@ -301,16 +301,20 @@ private:
     }
     bool hasSlotLocks() const { return static_cast<bool>(slot_locks_); }
 
-    // Paper §3.3.1: 16-bit op counter packed in the high bits of a pointer word.
+    // Policy 2 trigger: ST uses a plain 16-bit counter; MT packs into a word.
     static constexpr unsigned kOpCounterShift = 48;
     std::atomic<uintptr_t> op_counter_ptr_{0};
-    std::vector<uint16_t> init_histogram_; // Initial key distribution histogram
+    uint16_t op_counter_st_{0};
+    // Initial histogram for Policy 2 (allocated at bulkLoad / retrain only).
+    std::unique_ptr<uint16_t[]> init_histogram_;
+    size_t init_histogram_len_{0};
 
     // Held from leaf split gather through parent descriptor install (MT).
     std::mutex smo_lock_;
     bool smo_held_ = false;
 
     bool bumpOpCounterWrapped();
+    void ensureInitHistogram(size_t n);
 };
 
 #endif // HYPERCODE_LEAF_NODE_H

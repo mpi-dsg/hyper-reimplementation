@@ -1,6 +1,7 @@
 #include <iostream>
 #include <cmath>
 #include <algorithm>
+#include <numeric>
 #include "../include/leaf_node.h"
 #include "../include/epoch_manager.h"
 
@@ -63,7 +64,7 @@ void LeafNode::Slot::setOverflow(KeyType k, ValueType v) {
 LeafNode::LeafNode(double slope, KeyType minKey, KeyType maxKey)
         : slope_(slope), minKey_(minKey), maxPossibleKey_(std::numeric_limits<KeyType>::max()),
           MR_(ceil(slope * static_cast<double>(maxKey - minKey))), slots_(MR_+1),
-          op_counter_ptr_(0), init_histogram_(MR_+1, 0) {
+          op_counter_ptr_(0), op_counter_st_(0) {
     if (isHyperLockingEnabled()) {
         slot_locks_ = std::make_unique<HyperSlotMutex[]>(MR_ + 1);
     }
@@ -72,9 +73,16 @@ LeafNode::LeafNode(double slope, KeyType minKey, KeyType maxKey)
 LeafNode::LeafNode(const LeafNode& other)
         : slope_(other.slope_), minKey_(other.minKey_), maxPossibleKey_(other.maxPossibleKey_),
           MR_(other.MR_), slots_(other.MR_ + 1),
-          op_counter_ptr_(other.op_counter_ptr_.load()), init_histogram_(other.init_histogram_) {
+          op_counter_ptr_(other.op_counter_ptr_.load()), op_counter_st_(other.op_counter_st_),
+          init_histogram_len_(other.init_histogram_len_) {
     if (isHyperLockingEnabled()) {
         slot_locks_ = std::make_unique<HyperSlotMutex[]>(MR_ + 1);
+    }
+    if (other.init_histogram_ && other.init_histogram_len_) {
+        init_histogram_ = std::make_unique<uint16_t[]>(other.init_histogram_len_);
+        std::copy(other.init_histogram_.get(),
+                  other.init_histogram_.get() + other.init_histogram_len_,
+                  init_histogram_.get());
     }
     // Deep copy all slots
     for (size_t i = 0; i < other.slots_.size(); ++i) {
@@ -270,11 +278,22 @@ InsertReturn LeafNode::insert(
 }
 
 bool LeafNode::bumpOpCounterWrapped() {
-    // Increment the 16-bit field stored in the high bits of a pointer-sized word.
+    if (!isHyperLockingEnabled()) {
+        const uint16_t before = op_counter_st_++;
+        return before == 0xFFFF;
+    }
     const uintptr_t prev = op_counter_ptr_.fetch_add(
         uintptr_t(1) << kOpCounterShift, std::memory_order_relaxed);
     const uint16_t before = static_cast<uint16_t>(prev >> kOpCounterShift);
     return before == 0xFFFF;
+}
+
+void LeafNode::ensureInitHistogram(size_t n) {
+    if (!init_histogram_ || init_histogram_len_ != n) {
+        init_histogram_ = std::make_unique<uint16_t[]>(n);
+        init_histogram_len_ = n;
+    }
+    std::fill(init_histogram_.get(), init_histogram_.get() + n, 0);
 }
 
 void LeafNode::endSmo() {
@@ -404,7 +423,7 @@ bool LeafNode::maybeRebuildLowDensity(double min_density) {
 size_t LeafNode::memoryBytes() const {
     size_t bytes = sizeof(LeafNode);
     bytes += slots_.capacity() * sizeof(Slot);
-    bytes += init_histogram_.capacity() * sizeof(uint16_t);
+    bytes += init_histogram_len_ * sizeof(uint16_t);
     if (slot_locks_) bytes += (MR_ + 1) * sizeof(HyperSlotMutex);
     for (const auto& slot : slots_) {
         if (slot.isPointer()) {
@@ -419,9 +438,9 @@ size_t LeafNode::memoryBytes() const {
 }
 
 void LeafNode::bulkLoad(std::vector<std::pair<KeyType, ValueType>>&& data) {
-    // Initialize histograms and counters
-    init_histogram_.assign(slots_.size(), 0);
+    ensureInitHistogram(slots_.size());
     op_counter_ptr_.store(0, std::memory_order_relaxed);
+    op_counter_st_ = 0;
 
     size_t n = data.size();
     size_t i = 0;
@@ -675,10 +694,16 @@ bool LeafNode::checkPolicyTwo() {
     }
 
     int n = 0, m = 0;
-    for (int x : init_histogram_) n += x;
-    for (int x : current_hist) m += x;
-    if (n <= 0 || m <= 0) {
+    if (!init_histogram_ || init_histogram_len_ != current_hist.size()) {
         op_counter_ptr_.store(0, std::memory_order_relaxed);
+        op_counter_st_ = 0;
+        return false;
+    }
+    for (size_t i = 0; i < init_histogram_len_; ++i) n += init_histogram_[i];
+    for (int x : current_hist) m += x;
+    if (n <= 0 || m <= 0 || !init_histogram_) {
+        op_counter_ptr_.store(0, std::memory_order_relaxed);
+        op_counter_st_ = 0;
         return false;
     }
 
@@ -698,5 +723,6 @@ bool LeafNode::checkPolicyTwo() {
     double threshold = c_beta * std::sqrt((n + m) / static_cast<double>(n * m));
 
     op_counter_ptr_.store(0, std::memory_order_relaxed);
+    op_counter_st_ = 0;
     return d_stat > threshold;
 }

@@ -177,32 +177,28 @@ private:
         }
 
         const size_t total_slots = slot_counts.size();
-        const size_t non_empty = total_slots - empty_slots;
-        const size_t search_model_slots = total_slots - (empty_slots + accurate_slots);
 
-        // Standard deviation of conflicts
-        double mean = (search_slots + model_slots == 0) ? 0 :
-                      conflict_sum / static_cast<double>(search_slots + model_slots);
-        double variance = 0;
+        // Eqs. 4–5 style: σ(γ) over conflicted slots, mean conflict cost, λ-empty penalty.
+        double mean = conflicts.empty() ? 0.0 :
+                      conflict_sum / static_cast<double>(conflicts.size());
+        double variance = 0.0;
         for (auto c : conflicts) {
             variance += (c - mean) * (c - mean);
         }
-        double std_dev = (conflicts.size() == 0) ? 0 :
-                         sqrt(variance / conflicts.size());
+        double sigma = conflicts.empty() ? 0.0 :
+                       sqrt(variance / static_cast<double>(conflicts.size()));
 
-        // Normalized conflict cost (paper Algo 2 / Eqs. 4–5 style).
-        double conflict_cost = (search_model_slots == 0) ? 0 :
-                               conflict_sum / static_cast<double>(search_model_slots);
-        double norm_conflict = (non_empty == 0) ? 0 :
-                               conflict_cost / static_cast<double>(non_empty);
-
-        // Empty-slot memory penalty, weighted by oversubscription factor lambda.
-        double empty_ratio = static_cast<double>(empty_slots) / static_cast<double>(total_slots);
+        double conflict_cost = mean;  // average γ on conflicted (search/model) slots
+        double empty_ratio = static_cast<double>(empty_slots) /
+                             static_cast<double>(std::max<size_t>(total_slots, 1));
         double memory_penalty = lambda_ * empty_ratio;
 
-        // Balance prediction conflict cost against memory oversubscription.
-        double cost = std_dev + norm_conflict + memory_penalty;
+        // (void) unused counters kept for readability / future weighting.
+        (void)accurate_slots;
+        (void)search_slots;
+        (void)model_slots;
 
+        double cost = sigma + conflict_cost + memory_penalty;
         return {cost, slot_counts};
     }
 
