@@ -40,9 +40,13 @@ set(HYPER_LIB_SOURCES
 )
 
 add_executable(test_paper_delete tests/test_paper_delete.cpp ${HYPER_LIB_SOURCES})
+add_executable(test_paper_memory tests/test_paper_memory.cpp ${HYPER_LIB_SOURCES})
 if(OpenMP_CXX_FOUND)
     target_compile_options(test_paper_delete PUBLIC ${OpenMP_CXX_FLAGS})
     target_link_options(test_paper_delete PUBLIC ${OpenMP_CXX_FLAGS})
+    target_compile_options(test_paper_memory PUBLIC ${OpenMP_CXX_FLAGS})
+    target_link_options(test_paper_memory PUBLIC ${OpenMP_CXX_FLAGS})
 endif()
 enable_testing()
 add_test(NAME paper_delete COMMAND test_paper_delete)
+add_test(NAME paper_memory COMMAND test_paper_memory)

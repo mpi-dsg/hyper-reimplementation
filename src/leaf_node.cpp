@@ -275,6 +275,22 @@ bool LeafNode::maybeRebuildLowDensity(double min_density) {
     return true;
 }
 
+size_t LeafNode::memoryBytes() const {
+    size_t bytes = sizeof(LeafNode);
+    bytes += slots_.capacity() * sizeof(Slot);
+    bytes += init_histogram_.capacity() * sizeof(int);
+    for (const auto& slot : slots_) {
+        if (slot.isPointer()) {
+            OverflowBuffer* buffer = slot.data.overflowPtr.load(std::memory_order_acquire);
+            if (buffer) {
+                bytes += sizeof(OverflowBuffer);
+                bytes += buffer->size() * sizeof(std::pair<KeyType, ValueType>);
+            }
+        }
+    }
+    return bytes;
+}
+
 void LeafNode::bulkLoad(std::vector<std::pair<KeyType, ValueType>>&& data) {
     // Initialize histograms and counters
     init_histogram_.assign(slots_.size(), 0);

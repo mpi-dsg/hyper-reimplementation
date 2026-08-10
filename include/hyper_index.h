@@ -88,6 +88,26 @@ public:
     static constexpr double kMinLeafDensity = 0.25;
 
     /**
+     * @brief Memory breakdown matching the paper's "index size" vs "total size"
+     *        reporting (Fig. 11): index = inner structure; total includes leaves.
+     *
+     * Sizes are structural estimates (sizeof + heap payloads we own), not RSS.
+     */
+    struct MemoryStats {
+        size_t index_bytes = 0;  ///< Inner nodes (model + search) and their slots
+        size_t leaf_bytes = 0;   ///< Leaf nodes, overflow buffers, KV payloads
+        size_t total_bytes() const { return index_bytes + leaf_bytes; }
+    };
+
+    /**
+     * @brief Compute structural memory consumption of the live index tree.
+     */
+    MemoryStats memoryStats() const;
+
+    /// Convenience: total structural bytes (index + leaves).
+    size_t memoryBytes() const { return memoryStats().total_bytes(); }
+
+    /**
      * @brief Inserts multiple leaf node descriptors into the index
      * @param leafDescs Vector of key-leaf pairs to insert
      */
@@ -200,6 +220,12 @@ private:
      * @return InsertResult indicating success or retry needed
      */
     InsertResult handleRootUpdate(void* oldRoot, const std::vector<std::pair<KeyType, void*>>& splitDescriptors);
+
+    /**
+     * @brief Recursively accumulate MemoryStats for a tagged subtree.
+     */
+    void accumulateMemory(void* node, MemoryStats& stats,
+                          std::set<void*>& visited_nodes) const;
 };
 
 // Include node implementations after the Hyper class is defined

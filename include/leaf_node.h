@@ -187,6 +187,11 @@ public:
     bool maybeRebuildLowDensity(double min_density);
 
     /**
+     * @brief Structural heap/stack estimate for this leaf and its overflows.
+     */
+    size_t memoryBytes() const;
+
+    /**
      * @brief Load multiple key-value pairs into the leaf node
      * @param data Vector of key-value pairs to load
      */

@@ -1103,3 +1103,58 @@ InsertResult Hyper::handleRootUpdate(void* oldRoot, const std::vector<std::pair<
     
     return InsertResult::Success;
 }
+
+void Hyper::accumulateMemory(void* node, MemoryStats& stats,
+                             std::set<void*>& visited_nodes) const {
+    if (node == nullptr) return;
+
+    // Dedup on untagged address so duplicate slots and tag bits cannot
+    // re-enter the same physical node (avoids cycles / double-count).
+    void* identity = untagPointer(node);
+    if (!visited_nodes.insert(identity).second) return;
+
+    if (isLeafNode(node)) {
+        stats.leaf_bytes += taggedCast<LeafNode>(node)->memoryBytes();
+        return;
+    }
+
+    if (isModelInnerNode(node)) {
+        auto* model = taggedCast<ModelInnerNode>(node);
+        stats.index_bytes += sizeof(ModelInnerNode);
+        stats.index_bytes += model->getNumSlots() * sizeof(ModelInnerNode::Slot);
+        for (const auto& slot : model->getSlots()) {
+            void* child = nullptr;
+            if (slot.isRealChild()) {
+                child = slot.KeyChildPtr.second;
+            } else {
+                child = slot.getChildPtr();
+            }
+            if (child == nullptr) continue;
+            accumulateMemory(child, stats, visited_nodes);
+        }
+        return;
+    }
+
+    if (isSearchInnerNode(node)) {
+        auto* search = taggedCast<SearchInnerNode>(node);
+        auto children = search->getChildren();
+        stats.index_bytes += sizeof(SearchInnerNode);
+        // ChildEntry vector: key + pointer (+ lock heap object approximated)
+        stats.index_bytes += children.size() *
+                             (sizeof(KeyType) + sizeof(void*) + sizeof(std::mutex));
+        for (const auto& [key, child] : children) {
+            (void)key;
+            if (child == nullptr) continue;
+            accumulateMemory(child, stats, visited_nodes);
+        }
+    }
+}
+
+Hyper::MemoryStats Hyper::memoryStats() const {
+    MemoryStats stats;
+    void* root = root_.load(std::memory_order_acquire);
+    if (root == nullptr) return stats;
+    std::set<void*> visited;
+    accumulateMemory(root, stats, visited);
+    return stats;
+}
