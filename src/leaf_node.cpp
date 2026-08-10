@@ -176,7 +176,8 @@ InsertReturn LeafNode::insert(
         ValueType value,
         double delta) {
 
-    if (key >= maxPossibleKey_) {
+    // maxPossibleKey_ is inclusive (next sibling min - 1). Match find/erase.
+    if (key > maxPossibleKey_) {
         return InsertReturn(InsertResult::RetryFromRoot);
     }
 

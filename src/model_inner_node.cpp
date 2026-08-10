@@ -87,33 +87,42 @@ void ModelInnerNode::updateSlotDuplicateSeqLock(size_t idx, void* childPtr) {
 }
 
 void* ModelInnerNode::findChild(KeyType key) const {
-    // Predict slot position for the key
+    // Predict, correct one slot left if needed, then walk right while the next
+    // real child's boundary is still <= key. Needed when the model lands in a
+    // predecessor's duplicate region past a later child's min key (Fig. 6 + dups).
     size_t idx = predictSlot(key);
 
     KeyType slotKey;
     void* slotChild;
     bool isReal;
 
-    // Read the predicted slot with seq lock
     readSlotSeqLock(idx, slotKey, slotChild, isReal);
 
-    if (isReal) {
-        // Check if we need to look at the previous slot
-        if (slotKey > key && idx > 0) {
-            idx--;
-            readSlotSeqLock(idx, slotKey, slotChild, isReal);
-        }
-
-        if (isReal) {
-            return slotChild;
-        } else {
-            // This is a duplicate slot, return the direct child pointer
-            return slotChild;
-        }
-    } else {
-        // This is a duplicate slot, return the direct child pointer
-        return slotChild;
+    if (isReal && slotKey > key && idx > 0) {
+        idx--;
+        readSlotSeqLock(idx, slotKey, slotChild, isReal);
     }
+
+    while (true) {
+        size_t next = idx + 1;
+        KeyType nextKey = 0;
+        void* nextChild = nullptr;
+        bool nextReal = false;
+        while (next < slots_.size()) {
+            readSlotSeqLock(next, nextKey, nextChild, nextReal);
+            if (nextReal) break;
+            ++next;
+        }
+        if (next >= slots_.size() || !nextReal || nextKey > key) {
+            break;
+        }
+        idx = next;
+        slotKey = nextKey;
+        slotChild = nextChild;
+        isReal = true;
+    }
+
+    return slotChild;
 }
 
 void ModelInnerNode::setChild(KeyType key, void* child) {
@@ -468,38 +477,37 @@ std::tuple<std::unique_lock<HyperSlotMutex>, void*, size_t> ModelInnerNode::find
 
     readSlotSeqLock(idx, slotKey, slotChild, isReal);
 
+    if (isReal && slotKey > key && idx > 0) {
+        idx--;
+        readSlotSeqLock(idx, slotKey, slotChild, isReal);
+    }
+
+    while (true) {
+        size_t next = idx + 1;
+        KeyType nextKey = 0;
+        void* nextChild = nullptr;
+        bool nextReal = false;
+        while (next < slots_.size()) {
+            readSlotSeqLock(next, nextKey, nextChild, nextReal);
+            if (nextReal) break;
+            ++next;
+        }
+        if (next >= slots_.size() || !nextReal || nextKey > key) {
+            break;
+        }
+        idx = next;
+        slotKey = nextKey;
+        slotChild = nextChild;
+        isReal = true;
+    }
+
     size_t finalSlotIdx = idx;
-
-    if (isReal) {
-        // Check if we need to look at the previous slot
-        if (slotKey > key && idx > 0) {
-            idx--;
-            readSlotSeqLock(idx, slotKey, slotChild, isReal);
-            finalSlotIdx = idx;
-        }
-
-        if (isReal) {
-            // Found real child in current slot
-            std::unique_lock<HyperSlotMutex> lock(slots_[finalSlotIdx].lock);
-            return {std::move(lock), slotChild, finalSlotIdx};
-        } else {
-            // This is a duplicate slot - we need to find the real slot that owns this child
-            // Since duplicates now store direct pointers, we need to search for the real slot
-            void* targetChild = slotChild;
-            for (size_t i = 0; i < slots_.size(); i++) {
-                if (slots_[i].isRealChild() && slots_[i].KeyChildPtr.second == targetChild) {
-                    finalSlotIdx = i;
-                    break;
-                }
-            }
-        }
-    } else {
-        // This is a duplicate slot - we need to find the real slot that owns this child
+    // Lock the owning real slot when we landed on a duplicate.
+    if (!isReal) {
         void* targetChild = slotChild;
         for (size_t i = 0; i < slots_.size(); i++) {
             if (slots_[i].isRealChild() && slots_[i].KeyChildPtr.second == targetChild) {
                 finalSlotIdx = i;
-                slotChild = targetChild;
                 break;
             }
         }

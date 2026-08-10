@@ -754,9 +754,13 @@ std::vector<std::pair<KeyType, void*>> Hyper::buildLeavesForPartition(
     std::vector<std::pair<KeyType, void*>> keyLeafPtrs;
     keyLeafPtrs.reserve(segments.size());
 
-    for (const auto& seg : segments) {
+    for (size_t i = 0; i < segments.size(); ++i) {
+        const auto& seg = segments[i];
         // Create a leaf node for this segment
         auto* leaf = new LeafNode(seg.slope, seg.min_key, data[seg.end_idx].first);
+        if (i + 1 < segments.size()) {
+            leaf->setMaxPossibleKey(segments[i + 1].min_key - 1);
+        }
 
         // Extract data for this segment
         std::vector<std::pair<KeyType, ValueType>> segData(
