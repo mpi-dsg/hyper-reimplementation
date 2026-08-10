@@ -1,4 +1,5 @@
 #include "../include/model_inner_node.h"
+#include <thread>
 #include "../include/epoch_manager.h"
 
 // --- ModelInnerNode implementation ---
@@ -157,26 +158,21 @@ void ModelInnerNode::setChild(KeyType key, void* child) {
         if (!all_locked) {
             // Release all locks and retry from the beginning
             locks.clear();
+            std::this_thread::yield();
             continue;
         }
 
-        // All locks acquired successfully - begin seq lock write phase
-        // Increment all versions to odd numbers (in same order as locks were acquired)
+        // Mutexes held: read old slot state BEFORE beginWrite. Calling
+        // readSlotSeqLock after beginWrite deadlocks (odd version spin).
+        const bool wasReal = slots_[idx].isRealChild();
+        void* oldChild = wasReal ? slots_[idx].KeyChildPtr.second : slots_[idx].getChildPtr();
+        size_t newChildLeafCount = countLeafNodesInSubtree(child);
+
         for (auto it = slots_to_lock.rbegin(); it != slots_to_lock.rend(); ++it) {
             slots_[*it].beginWrite();
         }
 
-        // Count leaf nodes in the new subtree
-        size_t newChildLeafCount = countLeafNodesInSubtree(child);
-
-        // Update the main slot
-        KeyType oldKey;
-        void* oldChild;
-        bool wasReal;
-        readSlotSeqLock(idx, oldKey, oldChild, wasReal);
-
         if (wasReal) {
-            // Slot already has content, adjust leaf count
             size_t oldChildLeafCount = countLeafNodesInSubtree(oldChild);
 
             if (newChildLeafCount > oldChildLeafCount) {
@@ -187,35 +183,25 @@ void ModelInnerNode::setChild(KeyType key, void* child) {
                 leaf_node_count_.fetch_sub(decrease, std::memory_order_relaxed);
             }
         } else {
-            // New slot, add leaf count
             leaf_node_count_.fetch_add(newChildLeafCount, std::memory_order_relaxed);
         }
 
-        // Update slot data
         if (!slots_[idx].isRealChild()) {
             slots_[idx].setRealChild(key, child);
         } else {
-            // Safe deletion of old child before replacing
-            // void* oldChild = slots_[idx].KeyChildPtr.second;
-            // if (oldChild && oldChild != child) {
-            //     safeDelete(oldChild);
-            // }
             slots_[idx].KeyChildPtr.first = key;
             slots_[idx].KeyChildPtr.second = child;
         }
 
-        // Update duplicate slots with direct child pointers
         for (size_t i = 1; i < slots_to_lock.size(); i++) {
             slots_[slots_to_lock[i]].setDuplicate(child);
         }
 
-        // End seq lock write phase - increment versions to even numbers (reverse order)
         for (size_t i = 0; i < slots_to_lock.size(); i++) {
             slots_[slots_to_lock[i]].endWrite();
         }
 
         success = true;
-        // Locks are automatically released when going out of scope
     }
 }
 
@@ -258,31 +244,22 @@ void ModelInnerNode::updateChildWithExternalLock(KeyType key, void* child) {
         }
 
         if (!all_additional_locked) {
-            // Release all additional locks and retry from the beginning
             additional_locks.clear();
+            std::this_thread::yield();
             continue;
         }
 
-        // All locks acquired successfully - begin seq lock write phase
-        // Increment main slot version to odd number (already locked externally)
-        slots_[idx].beginWrite();
+        // Read old state before beginWrite (mutex held; avoid seqlock self-deadlock).
+        const bool wasReal = slots_[idx].isRealChild();
+        void* oldChild = wasReal ? slots_[idx].KeyChildPtr.second : slots_[idx].getChildPtr();
+        size_t newChildLeafCount = countLeafNodesInSubtree(child);
 
-        // Increment additional slot versions to odd numbers (in reverse order)
+        slots_[idx].beginWrite();
         for (auto it = additional_slots_to_lock.rbegin(); it != additional_slots_to_lock.rend(); ++it) {
             slots_[*it].beginWrite();
         }
 
-        // Count leaf nodes in the new subtree
-        size_t newChildLeafCount = countLeafNodesInSubtree(child);
-
-        // Update the main slot
-        KeyType oldKey;
-        void* oldChild;
-        bool wasReal;
-        readSlotSeqLock(idx, oldKey, oldChild, wasReal);
-
         if (wasReal) {
-            // Slot already has content, adjust leaf count
             size_t oldChildLeafCount = countLeafNodesInSubtree(oldChild);
 
             if (newChildLeafCount > oldChildLeafCount) {
@@ -293,11 +270,9 @@ void ModelInnerNode::updateChildWithExternalLock(KeyType key, void* child) {
                 leaf_node_count_.fetch_sub(decrease, std::memory_order_relaxed);
             }
         } else {
-            // New slot, add leaf count
             leaf_node_count_.fetch_add(newChildLeafCount, std::memory_order_relaxed);
         }
 
-        // Update slot data
         if (!slots_[idx].isRealChild()) {
             slots_[idx].setRealChild(key, child);
         } else {
@@ -305,22 +280,16 @@ void ModelInnerNode::updateChildWithExternalLock(KeyType key, void* child) {
             slots_[idx].KeyChildPtr.second = child;
         }
 
-        // Update duplicate slots with direct child pointers
         for (size_t slotIdx : additional_slots_to_lock) {
             slots_[slotIdx].setDuplicate(child);
         }
 
-        // End seq lock write phase - increment versions to even numbers (forward order)
         for (size_t slotIdx : additional_slots_to_lock) {
             slots_[slotIdx].endWrite();
         }
-
-        // End main slot write phase last
         slots_[idx].endWrite();
 
         success = true;
-        // Additional locks are automatically released when going out of scope
-        // Main slot lock remains held by caller
     }
 }
 

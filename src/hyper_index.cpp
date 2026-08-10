@@ -273,26 +273,30 @@ InsertResult Hyper::insertAttempt(KeyType key, ValueType value) {
 
         if (isModelInnerNode(cur)) {
             auto* modelNode = taggedCast<ModelInnerNode>(cur);
-            auto [slotLock, nextNode, slotIdx] = modelNode->findChildWithLock(key);
-            parentSlotIdx = slotIdx;
-
-            // Release lock immediately - we only need it for split operations
-            slotLock.unlock();
-
-            __builtin_prefetch(nextNode, 0, 3);
-            cur = nextNode;
+            if (!isHyperLockingEnabled()) {
+                parentSlotIdx = modelNode->getSlotIndex(key);
+                cur = modelNode->findChild(key);
+            } else {
+                auto [slotLock, nextNode, slotIdx] = modelNode->findChildWithLock(key);
+                parentSlotIdx = slotIdx;
+                if (slotLock.owns_lock()) {
+                    slotLock.unlock();
+                }
+                cur = nextNode;
+            }
+            __builtin_prefetch(cur, 0, 3);
 
         } else if (isSearchInnerNode(cur)) {
             auto* searchNode = taggedCast<SearchInnerNode>(cur);
             parentSlotIdx = searchNode->findChildIndex(key);
-
-            auto [slotMutexPtr, nextNode] = searchNode->getSlotLockAndChild(parentSlotIdx);
-
-            {
+            if (!isHyperLockingEnabled()) {
+                cur = searchNode->findChild(key);
+            } else {
+                auto [slotMutexPtr, nextNode] = searchNode->getSlotLockAndChild(parentSlotIdx);
                 std::lock_guard<std::mutex> slot_guard(*slotMutexPtr);
-                __builtin_prefetch(nextNode, 0, 3);
                 cur = nextNode;
             }
+            __builtin_prefetch(cur, 0, 3);
         } else {
             break;
         }

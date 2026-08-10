@@ -374,6 +374,12 @@ KeyType LeafNode::decodeKey(KeyType stored_key) const {
 }
 
 std::optional<std::vector<std::pair<KeyType, void*>>> LeafNode::performSplitWithParentLock(double delta) {
+    // Paper §6.1 ST mode: skip fine-grained locking.
+    if (!isHyperLockingEnabled()) {
+        auto data = gatherAll();
+        return performSplit(data, delta);
+    }
+
     // Wait until all leaf node slots are free
     // This is a busy-wait loop, but splits should be rare
     while (true) {
