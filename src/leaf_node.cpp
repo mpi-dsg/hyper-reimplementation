@@ -643,15 +643,22 @@ bool LeafNode::tryExpandInPlace(const KvVec& data) {
     KeyType maxK = data.back().first;
     if (maxK <= minK) return false;
 
-    // Cap leaf slot array (~1MB of 16B slots) so expand cannot explode memory.
-    constexpr size_t kMaxMR = (1u << 20) / 16;
-    size_t target = std::max(MR_ * 2, data.size());
+    // Only expand when the leaf is genuinely dense; sparse expands just
+    // inflate O(MR) policy walks and kill ST throughput (seen on OSM).
+    if (data.size() * 2 <= MR_) return false;
+
+    // Modest 1.5× grow, hard-capped — avoids cascading multi-MB leaves.
+    constexpr size_t kMaxMR = 8192;
+    size_t target = std::max(MR_ + MR_ / 2, data.size());
     size_t newMR = std::min(kMaxMR, target);
     if (newMR <= MR_) return false;
 
     double newSlope = static_cast<double>(newMR) / static_cast<double>(maxK - minK);
     rebuildInPlace(KvVec(data), newSlope, minK, maxK);
-    return maxConflictCount() < kMaxLeafConflicts;
+    if (maxConflictCount() < kMaxLeafConflicts) return true;
+    // Expand did not help — leave rebuilt leaf for the imminent split path
+    // (same KV set; parent will replace this node).
+    return false;
 }
 
 bool LeafNode::tryRetrainInPlace(double delta) {
