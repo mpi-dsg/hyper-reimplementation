@@ -241,6 +241,31 @@ public:
     void endSmo();
 
 private:
+    using KvVec = std::vector<std::pair<KeyType, ValueType>>;
+    using PlaSeg = Hyper::PLASegment;
+
+    /**
+     * @brief Build PLA segments for sorted leaf data (shared by retrain/split).
+     */
+    static std::vector<PlaSeg> buildSegments(const KvVec& data, double delta);
+
+    /**
+     * @brief Rebuild this leaf's slots from @p data with a new linear model.
+     */
+    void rebuildInPlace(KvVec data, double slope, KeyType minKey, KeyType modelMaxKey);
+
+    /**
+     * @brief Expand slot capacity (~2×) and rebulk without PLA — ALEX-style
+     *        local SMO. Returns true if peak conflicts fall under threshold.
+     */
+    bool tryExpandInPlace(const KvVec& data);
+
+    /**
+     * @brief Single-segment PLA retrain using pre-gathered @p data.
+     *        On multi-segment failure, fills @p segs_out for reuse by split.
+     */
+    bool tryRetrainInPlace(const KvVec& data, double delta,
+                           std::vector<PlaSeg>* segs_out);
     /**
      * @brief Predicts the slot position for a given key using the linear model
      * @param key Key to predict slot for
@@ -287,6 +312,12 @@ private:
     std::vector<std::pair<KeyType, void*>> performSplit(
             const std::vector<std::pair<KeyType, ValueType>>& data,
             double delta);
+
+    /**
+     * @brief Split using precomputed PLA segments (avoids a second segmentation).
+     */
+    std::vector<std::pair<KeyType, void*>> performSplitWithSegments(
+            const KvVec& data, const std::vector<PlaSeg>& segments);
 
     double slope_;                   // Slope of the linear model
     size_t MR_;                      // Maximum range of slots

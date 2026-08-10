@@ -249,15 +249,23 @@ InsertReturn LeafNode::insert(
         needsRetrain = true;
     }
 
-    if (needsRetrain && !needsSplit) {
-        if (tryRetrainInPlace(delta)) {
+    if (!needsRetrain && !needsSplit) {
+        return InsertReturn(InsertResult::Success);
+    }
+
+    // One gatherAll for expand → retrain → split (was 2–3× before).
+    KvVec data = gatherAll();
+    std::vector<PlaSeg> segments;
+
+    if (!needsSplit) {
+        // Soft Policy 1/2: prefer local SMOs that avoid parent reinsert.
+        if (tryExpandInPlace(data)) {
+            return InsertReturn(InsertResult::Success);
+        }
+        if (tryRetrainInPlace(data, delta, &segments)) {
             return InsertReturn(InsertResult::Success);
         }
         needsSplit = true;
-    }
-
-    if (!needsSplit) {
-        return InsertReturn(InsertResult::Success);
     }
 
     // §4.2.2: hold SMO lock so readers still see this leaf until parents updated.
@@ -266,7 +274,18 @@ InsertReturn LeafNode::insert(
         smo_held_ = true;
     }
 
-    auto splitResult = performSplitWithParentLock(delta);
+    std::optional<std::vector<std::pair<KeyType, void*>>> splitResult;
+    if (!isHyperLockingEnabled()) {
+        if (segments.size() >= 2) {
+            splitResult = performSplitWithSegments(data, segments);
+        } else {
+            splitResult = performSplit(data, delta);
+        }
+    } else {
+        // MT: re-gather under all slot locks; soft-path segments may be stale.
+        splitResult = performSplitWithParentLock(delta);
+    }
+
     if (splitResult.has_value()) {
         return InsertReturn(InsertResult::SuccessWithSplit, std::move(*splitResult),
                             smo_held_ ? this : nullptr);
@@ -569,18 +588,16 @@ std::vector<std::unique_lock<HyperSlotMutex>> LeafNode::tryLockAllSlots() {
     return locks;
 }
 
-bool LeafNode::tryRetrainInPlace(double delta) {
-    auto data = gatherAll();
-    if (data.size() < 2) return true;
-
-    std::vector<Hyper::PLASegment> segments;
+std::vector<LeafNode::PlaSeg> LeafNode::buildSegments(const KvVec& data, double delta) {
+    std::vector<PlaSeg> segments;
+    if (data.size() < 2) return segments;
     KeyType maxKey = data.back().first;
     hyperpgm::internal::make_segmentation_par(
             data.size(),
             static_cast<size_t>(delta),
             [&](size_t i) { return data[i].first; },
             [&](const auto& cs) {
-                Hyper::PLASegment seg{};
+                PlaSeg seg{};
                 seg.min_key = cs.get_first_x();
                 seg.max_key = cs.get_last_x();
                 if (cs.get_last_x() >= maxKey) seg.max_key = data.back().first;
@@ -589,81 +606,88 @@ bool LeafNode::tryRetrainInPlace(double delta) {
                 seg.slope = segSlope;
                 auto start_it = std::lower_bound(data.begin(), data.end(), seg.min_key,
                                                  [](const auto& pair, KeyType key) { return pair.first < key; });
-                seg.start_idx = std::distance(data.begin(), start_it);
+                seg.start_idx = static_cast<size_t>(std::distance(data.begin(), start_it));
                 auto end_it = std::lower_bound(data.begin(), data.end(), seg.max_key,
                                                [](const auto& pair, KeyType key) { return pair.first < key; });
-                seg.end_idx = std::distance(data.begin(), end_it);
+                seg.end_idx = static_cast<size_t>(std::distance(data.begin(), end_it));
                 segments.push_back(seg);
             });
     if (!segments.empty() && segments.back().start_idx >= data.size()) {
         segments.pop_back();
     }
+    return segments;
+}
+
+void LeafNode::rebuildInPlace(KvVec data, double slope, KeyType minKey, KeyType modelMaxKey) {
+    KeyType saved_max = maxPossibleKey_;
+    for (auto& slot : slots_) {
+        slot.destroy();
+    }
+    slope_ = slope;
+    minKey_ = minKey;
+    MR_ = static_cast<size_t>(std::ceil(slope_ * static_cast<double>(modelMaxKey - minKey_)));
+    if (MR_ < 1) MR_ = 1;
+    slots_ = std::vector<Slot>(MR_ + 1);
+    if (isHyperLockingEnabled()) {
+        slot_locks_ = std::make_unique<HyperSlotMutex[]>(MR_ + 1);
+    } else {
+        slot_locks_.reset();
+    }
+    maxPossibleKey_ = saved_max;
+    bulkLoad(std::move(data));
+}
+
+bool LeafNode::tryExpandInPlace(const KvVec& data) {
+    if (data.size() < 2) return true;
+    KeyType minK = data.front().first;
+    KeyType maxK = data.back().first;
+    if (maxK <= minK) return false;
+
+    // Cap leaf slot array (~1MB of 16B slots) so expand cannot explode memory.
+    constexpr size_t kMaxMR = (1u << 20) / 16;
+    size_t target = std::max(MR_ * 2, data.size());
+    size_t newMR = std::min(kMaxMR, target);
+    if (newMR <= MR_) return false;
+
+    double newSlope = static_cast<double>(newMR) / static_cast<double>(maxK - minK);
+    rebuildInPlace(KvVec(data), newSlope, minK, maxK);
+    return maxConflictCount() < kMaxLeafConflicts;
+}
+
+bool LeafNode::tryRetrainInPlace(double delta) {
+    KvVec data = gatherAll();
+    return tryRetrainInPlace(data, delta, nullptr);
+}
+
+bool LeafNode::tryRetrainInPlace(const KvVec& data, double delta,
+                                 std::vector<PlaSeg>* segs_out) {
+    if (data.size() < 2) return true;
+    auto segments = buildSegments(data, delta);
+    if (segs_out) *segs_out = segments;
 
     // Cheap retrain only when a single PLA segment still covers the leaf.
     if (segments.size() != 1) return false;
 
     const auto& seg = segments.front();
-    KeyType saved_max = maxPossibleKey_;
-    for (auto& slot : slots_) {
-        slot.destroy();
-    }
-    slope_ = seg.slope;
-    minKey_ = seg.min_key;
-    MR_ = static_cast<size_t>(std::ceil(slope_ * static_cast<double>(seg.max_key - minKey_)));
-    slots_ = std::vector<Slot>(MR_ + 1);
-    maxPossibleKey_ = saved_max;
-    bulkLoad(std::move(data));
+    rebuildInPlace(KvVec(data), seg.slope, seg.min_key, seg.max_key);
     return maxConflictCount() < kMaxLeafConflicts;
 }
 
-std::vector<std::pair<KeyType, void*>> LeafNode::performSplit(
-        const std::vector<std::pair<KeyType, ValueType>>& data,
-        double delta) {
-
-    // Generate piece-wise linear segments for the data
-    std::vector<Hyper::PLASegment> segments;
-    KeyType maxKey = data.back().first;
-
-    hyperpgm::internal::make_segmentation_par(
-            data.size(),
-            static_cast<size_t>(delta),
-            [&](size_t i) { return data[i].first; },
-            [&](const auto& cs) {
-                Hyper::PLASegment seg{};
-                seg.min_key = cs.get_first_x();
-                seg.max_key = cs.get_last_x();
-                if (cs.get_last_x() >= maxKey)
-                    seg.max_key = data.back().first;
-                auto [segSlope, intercept] = cs.get_floating_point_segment(seg.min_key);
-                seg.slope = segSlope;
-                auto start_it = std::lower_bound(data.begin(), data.end(), seg.min_key,
-                                                 [](const auto& pair, KeyType key) { return pair.first < key; });
-                seg.start_idx = std::distance(data.begin(), start_it);
-                auto end_it = std::lower_bound(data.begin(), data.end(), seg.max_key,
-                                               [](const auto& pair, KeyType key) { return pair.first < key; });
-                seg.end_idx = std::distance(data.begin(), end_it);
-                segments.push_back(seg);
-            }
-    );
-
-    // Check if the last segment is valid, remove it if not
-    if (!segments.empty() && segments.back().start_idx >= data.size()) {
-        segments.pop_back();
-    }
-
+std::vector<std::pair<KeyType, void*>> LeafNode::performSplitWithSegments(
+        const KvVec& data, const std::vector<PlaSeg>& segments) {
     std::vector<std::pair<KeyType, void*>> newLeaves;
+    if (segments.empty() || data.empty()) return newLeaves;
     newLeaves.reserve(segments.size());
 
-    // Split the node into multiple nodes
     for (size_t i = 0; i < segments.size(); ++i) {
-        auto seg = segments[i];
-        std::vector<std::pair<KeyType, ValueType>> segData(
-                std::make_move_iterator(const_cast<std::pair<KeyType, ValueType>*>(&data[seg.start_idx])),
-                std::make_move_iterator(const_cast<std::pair<KeyType, ValueType>*>(&data[seg.end_idx + 1]))
-        );
+        const auto& seg = segments[i];
+        size_t end_inclusive = std::min(seg.end_idx, data.size() - 1);
+        if (seg.start_idx >= data.size() || seg.start_idx > end_inclusive) continue;
+        KvVec segData(data.begin() + static_cast<std::ptrdiff_t>(seg.start_idx),
+                      data.begin() + static_cast<std::ptrdiff_t>(end_inclusive) + 1);
 
         LeafNode* segLeaf = new LeafNode(seg.slope, seg.min_key, seg.max_key);
-        if (i < segments.size() - 1) {
+        if (i + 1 < segments.size()) {
             segLeaf->maxPossibleKey_ = segments[i + 1].min_key - 1;
         }
         segLeaf->bulkLoad(std::move(segData));
@@ -672,10 +696,15 @@ std::vector<std::pair<KeyType, void*>> LeafNode::performSplit(
         newLeaves.emplace_back(seg.min_key, taggedLeaf);
     }
 
-    // Return new leaves in reverse order
     std::reverse(newLeaves.begin(), newLeaves.end());
-
     return newLeaves;
+}
+
+std::vector<std::pair<KeyType, void*>> LeafNode::performSplit(
+        const std::vector<std::pair<KeyType, ValueType>>& data,
+        double delta) {
+    auto segments = buildSegments(data, delta);
+    return performSplitWithSegments(data, segments);
 }
 
 bool LeafNode::checkPolicyTwo() {
