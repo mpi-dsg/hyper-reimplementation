@@ -107,8 +107,11 @@ InsertReturn LeafNode::insert(
     size_t idx = predictSlot(key);
     bool needsSplit = false;
 
-    // Lock only the specific slot we're inserting into
-    std::unique_lock<std::mutex> slotLock(slots_[idx].lock);
+    // Lock only the specific slot we're inserting into (skipped if ST mode).
+    std::unique_lock<std::mutex> slotLock(slots_[idx].lock, std::defer_lock);
+    if (isHyperLockingEnabled()) {
+        slotLock.lock();
+    }
     auto& slot = slots_[idx];
 
     // Handle different scenarios based on slot state
@@ -148,8 +151,10 @@ InsertReturn LeafNode::insert(
         }
     }
 
-    // Release the slot lock before checking for split
-    slotLock.unlock();
+    // Release the slot lock before checking for split (no-op if locks disabled).
+    if (slotLock.owns_lock()) {
+        slotLock.unlock();
+    }
 
     // Increment operation counter
     op_counter_.fetch_add(1, std::memory_order_relaxed);
@@ -201,8 +206,8 @@ bool LeafNode::erase(KeyType key) {
     size_t idx = predictSlot(key);
     auto& slot = slots_[idx];
 
-    // Lock the specific slot for erase operation
-    std::lock_guard<std::mutex> slotLock(slot.lock);
+    // Lock the specific slot for erase operation (no-op if locking disabled).
+    MaybeLock slotLock(slot.lock);
 
     // Paper §4.4: deleting the leftmost key must not change minKey_ metadata.
     // minKey_ is intentionally left untouched below.

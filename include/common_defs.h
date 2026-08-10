@@ -18,6 +18,38 @@ using KeyType = uint64_t;    ///< 64-bit unsigned integer keys
 using ValueType = uint64_t;  ///< 64-bit unsigned integer values
 
 /**
+ * @brief Global switch for fine-grained locking (paper §6.1: disabled in
+ *        single-thread evaluation for fairness vs unlocked baselines).
+ */
+inline std::atomic<bool>& hyperLockingEnabled() {
+    static std::atomic<bool> enabled{true};
+    return enabled;
+}
+
+inline void setHyperLockingEnabled(bool enabled) {
+    hyperLockingEnabled().store(enabled, std::memory_order_release);
+}
+
+inline bool isHyperLockingEnabled() {
+    return hyperLockingEnabled().load(std::memory_order_acquire);
+}
+
+/**
+ * @brief Mutex guard that is a no-op when Hyper locking is disabled.
+ */
+class MaybeLock {
+public:
+    explicit MaybeLock(std::mutex& m) : lock_(m, std::defer_lock) {
+        if (isHyperLockingEnabled()) {
+            lock_.lock();
+        }
+    }
+
+private:
+    std::unique_lock<std::mutex> lock_;
+};
+
+/**
  * @enum NodeType
  * @brief Defines the possible types of nodes in the index
  *

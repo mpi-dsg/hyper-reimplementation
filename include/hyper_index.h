@@ -41,6 +41,17 @@ public:
               max_node_size_(max_node_size) {}
 
     /**
+     * @brief Enable/disable fine-grained locking (paper §6.1).
+     *
+     * Single-thread evaluations in the paper disable locking. Default is on.
+     */
+    static void setLockingEnabled(bool enabled) {
+        setHyperLockingEnabled(enabled);
+    }
+
+    static bool lockingEnabled() { return isHyperLockingEnabled(); }
+
+    /**
      * @brief Destructor for cleaning up the index
      */
     ~Hyper();
