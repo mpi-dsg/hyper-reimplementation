@@ -65,6 +65,12 @@ public:
     void addChild(KeyType boundaryKey, void* child);
 
     /**
+     * @brief Replace a child pointer in-place (keeps boundary key), or insert if missing.
+     * @return true if an existing entry was replaced
+     */
+    bool replaceChildPtr(void* oldChild, KeyType boundaryKey, void* newChild);
+
+    /**
      * @brief Finds the child node responsible for the given key
      * @param key Key to find child for
      * @return Pointer to the child node

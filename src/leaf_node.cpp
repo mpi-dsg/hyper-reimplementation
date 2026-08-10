@@ -429,8 +429,12 @@ size_t LeafNode::memoryBytes() const {
         if (slot.isPointer()) {
             OverflowBuffer* buffer = slot.overflowPtr;
             if (buffer) {
+                // sizeof(OverflowBuffer) already includes inline SSO storage;
+                // only add heap payload beyond that.
                 bytes += sizeof(OverflowBuffer);
-                bytes += buffer->size() * sizeof(std::pair<KeyType, ValueType>);
+                if (buffer->size() > OverflowBuffer::kInlineCap) {
+                    bytes += buffer->size() * sizeof(std::pair<KeyType, ValueType>);
+                }
             }
         }
     }
@@ -499,7 +503,8 @@ std::vector<std::pair<KeyType, ValueType>> LeafNode::gatherAll() const {
         } else if (s.isPointer()) {
             OverflowBuffer* buffer = s.overflowPtr;
             if (buffer) {
-                const auto& vec = buffer->data();
+                // Prefer get_all() — data() materializes a lasting view_cache_ copy.
+                auto vec = buffer->get_all();
                 all.insert(all.end(), vec.begin(), vec.end());
             }
         }

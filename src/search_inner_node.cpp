@@ -51,6 +51,38 @@ void SearchInnerNode::addChild(KeyType boundaryKey, void* child) {
     incrementVersion();
 }
 
+bool SearchInnerNode::replaceChildPtr(void* oldChild, KeyType boundaryKey, void* newChild) {
+    std::unique_lock<HyperSlotMutex> guard(structural_lock_, std::defer_lock);
+    if (isHyperLockingEnabled()) {
+        guard.lock();
+    }
+
+    incrementVersion();
+    for (auto& entry : children_) {
+        if (entry.childPtr == oldChild) {
+            entry.childPtr = newChild;
+            // Keep the existing boundary unless caller wants a tighter one.
+            if (boundaryKey < entry.boundaryKey) {
+                entry.boundaryKey = boundaryKey;
+            }
+            incrementVersion();
+            return true;
+        }
+    }
+    // Fallback: insert under the provided boundary.
+    auto it = std::lower_bound(children_.begin(), children_.end(), boundaryKey,
+                               [](const ChildEntry& entry, const KeyType& key) {
+                                   return entry.boundaryKey < key;
+                               });
+    if (it != children_.end() && it->boundaryKey == boundaryKey) {
+        it->childPtr = newChild;
+    } else {
+        children_.emplace(it, boundaryKey, newChild);
+    }
+    incrementVersion();
+    return false;
+}
+
 void* SearchInnerNode::findChild(KeyType key) const {
     return readWithVersionCheck([this, key]() -> void* {
         if (children_.empty()) {

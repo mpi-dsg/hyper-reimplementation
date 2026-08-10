@@ -436,7 +436,14 @@ void Hyper::insertLeafDescriptors(const std::vector<std::pair<KeyType, void*>>& 
                             void* taggedNewModel = buildInnerFromChildren(newLeaves);
                             mNode->updateChildWithExternalLock(boundary, taggedNewModel);
 
-                            // Clean up old model node
+                            // New tree owns rebuilt leaves; drop old subtree (and the
+                            // temporary leafDesc leaf that was folded into childData).
+                            if (isModelInnerNode(childPtr)) {
+                                safeDelete(taggedCast<ModelInnerNode>(childPtr));
+                            }
+                            if (isLeafNode(leafDesc.second)) {
+                                safeDelete(taggedCast<LeafNode>(leafDesc.second));
+                            }
 
                             break;
                         }
@@ -938,35 +945,35 @@ void Hyper::collectAllData(void* node, std::vector<std::pair<KeyType, ValueType>
 }
 
 void Hyper::convertSearchNodeToModelNode(SearchInnerNode* sNode, void* parentNode) {
-    // Paper §3.3.2: S-inner → M-inner when children > 8, rebuilding leaves for GC.
+    // Paper §3.3.2: S-inner → M-inner from existing children (same as M-inner
+    // rebuild — do not rewrite leaves via collectAllData + PLA). Rebuilding
+    // leaves here duplicated every KV and ballooned OSM memory ~2×.
     // Parent may be null / ModelInner / SearchInner — never assume ModelInner.
-    void* taggedSearchNode = tagPointer(sNode, NodeType::SearchInner);
-    std::vector<std::pair<KeyType, ValueType>> subtreeData;
-    collectAllData(taggedSearchNode, subtreeData);
-    std::vector<std::pair<KeyType, void*>> newLeaves = buildLeaves(std::move(subtreeData));
-    if (newLeaves.empty()) return;
-    KeyType boundary = newLeaves.front().first;
-    void* taggedNew = buildInnerFromChildren(newLeaves);
+    auto children = sNode->getChildren();
+    if (children.size() <= 1) return;
+    KeyType boundary = children.front().first;
+    void* taggedNew = buildInnerFromChildren(children);
 
-    auto abandonNewTree = [&](void* node) {
-        // New tree owns freshly built leaves — delete fully.
-        if (isLeafNode(node)) {
-            delete taggedCast<LeafNode>(node);
-        } else if (isModelInnerNode(node)) {
+    auto abandonNewInner = [&](void* node) {
+        // Newly allocated inner points at the same children as the S-inner.
+        if (isModelInnerNode(node)) {
+            taggedCast<ModelInnerNode>(node)->disownChildren();
             delete taggedCast<ModelInnerNode>(node);
         } else if (isSearchInnerNode(node)) {
+            taggedCast<SearchInnerNode>(node)->disownChildren();
             delete taggedCast<SearchInnerNode>(node);
         }
     };
 
     std::unique_lock<HyperSlotMutex> parentLock;
+    void* taggedSearchNode = tagPointer(sNode, NodeType::SearchInner);
 
     if (parentNode == nullptr) {
         if (!updateRootRCU(taggedSearchNode, taggedNew)) {
-            abandonNewTree(taggedNew);
+            abandonNewInner(taggedNew);
             return;
         }
-        // Old S-inner (and its old leaves) reclaimed.
+        sNode->disownChildren();
         safeDelete(sNode);
         return;
     }
@@ -975,7 +982,9 @@ void Hyper::convertSearchNodeToModelNode(SearchInnerNode* sNode, void* parentNod
         auto* modelParent = taggedCast<ModelInnerNode>(parentNode);
         size_t slotIdx = 0;
         bool found = false;
+        // Prefer the real slot that owns this S-inner (skip duplicate aliases).
         for (size_t i = 0; i < modelParent->getNumSlots(); i++) {
+            if (!modelParent->getSlots()[i].isRealChild()) continue;
             if (modelParent->getChildAtIndex(i) == taggedSearchNode) {
                 slotIdx = i;
                 found = true;
@@ -983,27 +992,28 @@ void Hyper::convertSearchNodeToModelNode(SearchInnerNode* sNode, void* parentNod
             }
         }
         if (!found) {
-            abandonNewTree(taggedNew);
+            abandonNewInner(taggedNew);
             return;
         }
         if (isHyperLockingEnabled()) {
             parentLock = std::unique_lock<HyperSlotMutex>(modelParent->getSlotLock(slotIdx));
         }
-        if (modelParent->getSlots()[slotIdx].isRealChild()) {
-            boundary = modelParent->getSlots()[slotIdx].KeyChildPtr.first;
-        }
+        boundary = modelParent->getSlots()[slotIdx].KeyChildPtr.first;
         modelParent->updateChildWithExternalLock(boundary, taggedNew);
     } else if (isSearchInnerNode(parentNode)) {
         auto* searchParent = taggedCast<SearchInnerNode>(parentNode);
         if (isHyperLockingEnabled()) {
             parentLock = std::unique_lock<HyperSlotMutex>(searchParent->structural_lock_);
         }
-        searchParent->addChild(boundary, taggedNew);
+        // Replace by pointer so a boundary-key mismatch cannot leave the old
+        // S-inner dangling beside the new M-inner.
+        searchParent->replaceChildPtr(taggedSearchNode, boundary, taggedNew);
     } else {
-        abandonNewTree(taggedNew);
+        abandonNewInner(taggedNew);
         return;
     }
 
+    sNode->disownChildren();
     safeDelete(sNode);
 }
 
