@@ -44,7 +44,7 @@ void LeafNode::Slot::setSingle(KeyType k, ValueType v) {
 void LeafNode::Slot::setOverflow(KeyType k, ValueType v) {
     OverflowBuffer* current = overflowPtr;
     if (!current) {
-        OverflowBuffer* newBuffer = new OverflowBuffer(4);
+        OverflowBuffer* newBuffer = new OverflowBuffer(OverflowBuffer::kDefaultCapacity);
         newBuffer->bulk_load({{k, v}});
         key = 0;
         overflowPtr = newBuffer;
@@ -131,7 +131,7 @@ size_t LeafNode::maxConflictCount() const {
 void LeafNode::overflowInsert(Slot& slot, KeyType key, ValueType value) {
     OverflowBuffer* current = slot.overflowPtr;
     if (!current) {
-        OverflowBuffer* neu = new OverflowBuffer(4);
+        OverflowBuffer* neu = new OverflowBuffer(OverflowBuffer::kDefaultCapacity);
         neu->bulk_load({{key, value}});
         slot.key = 0;
         slot.overflowPtr = neu;
@@ -160,7 +160,7 @@ bool LeafNode::overflowErase(Slot& slot, KeyType key) {
             slot.key = 0;
             slot.value = 0;
         } else if (current->size() == 1) {
-            auto only = current->data().front();
+            auto only = current->front();
             delete current;
             slot.overflowPtr = nullptr;
             slot.key = 0;
@@ -178,7 +178,7 @@ bool LeafNode::overflowErase(Slot& slot, KeyType key) {
         slot.key = 0;
         slot.value = 0;
     } else if (neu->size() == 1) {
-        auto only = neu->data().front();
+        auto only = neu->front();
         delete neu;
         slot.overflowPtr = nullptr;
             slot.key = 0;
@@ -223,7 +223,7 @@ InsertReturn LeafNode::insert(
             if (p1.first < p0.first) std::swap(p0, p1);
             // Clear KV tag before storing overflow pointer (union aliasing).
             slot.key = 0;
-            OverflowBuffer* newBuffer = new OverflowBuffer(4);
+            OverflowBuffer* newBuffer = new OverflowBuffer(OverflowBuffer::kDefaultCapacity);
             newBuffer->bulk_load({p0, p1});
             slot.key = 0;
             slot.overflowPtr = newBuffer;
@@ -430,7 +430,7 @@ size_t LeafNode::memoryBytes() const {
             OverflowBuffer* buffer = slot.overflowPtr;
             if (buffer) {
                 bytes += sizeof(OverflowBuffer);
-                bytes += buffer->data().capacity() *
+                bytes += buffer->capacity() *
                          sizeof(std::pair<KeyType, ValueType>);
             }
         }
@@ -499,9 +499,8 @@ std::vector<std::pair<KeyType, ValueType>> LeafNode::gatherAll() const {
             all.emplace_back(decodeKey(s.key), s.value);
         } else if (s.isPointer()) {
             OverflowBuffer* buffer = s.overflowPtr;
-            if (buffer) {
-                const auto& vec = buffer->data();
-                all.insert(all.end(), vec.begin(), vec.end());
+            if (buffer && buffer->size() > 0) {
+                all.insert(all.end(), buffer->begin(), buffer->end());
             }
         }
     }

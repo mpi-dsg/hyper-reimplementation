@@ -599,11 +599,10 @@ std::vector<std::pair<KeyType, ValueType>> Hyper::rangeQuery(KeyType left, KeyTy
             } else if (slot.isPointer() && slot.overflowPtr) {
                 OverflowBuffer* buf = slot.overflowPtr;
                 if (!buf) continue;
-                const auto& buffer_data = buf->data();
                 auto startIter = std::lower_bound(
-                    buffer_data.begin(), buffer_data.end(), left,
+                    buf->begin(), buf->end(), left,
                     [](const auto& pair, const KeyType key) { return pair.first < key; });
-                for (auto it = startIter; it != buffer_data.end(); ++it) {
+                for (auto it = startIter; it != buf->end(); ++it) {
                     if (it->first <= right) {
                         leaf_hits.push_back(*it);
                     } else {
