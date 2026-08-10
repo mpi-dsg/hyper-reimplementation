@@ -189,16 +189,18 @@ private:
         double std_dev = (conflicts.size() == 0) ? 0 :
                          sqrt(variance / conflicts.size());
 
-        // Normalized conflict cost
+        // Normalized conflict cost (paper Algo 2 / Eqs. 4–5 style).
         double conflict_cost = (search_model_slots == 0) ? 0 :
                                conflict_sum / static_cast<double>(search_model_slots);
-        double norm_conflict = conflict_cost / non_empty;
+        double norm_conflict = (non_empty == 0) ? 0 :
+                               conflict_cost / static_cast<double>(non_empty);
 
-        // Empty slots ratio
-        double empty_ratio = static_cast<double>(empty_slots) / total_slots;
+        // Empty-slot memory penalty, weighted by oversubscription factor lambda.
+        double empty_ratio = static_cast<double>(empty_slots) / static_cast<double>(total_slots);
+        double memory_penalty = lambda_ * empty_ratio;
 
-        // Final cost combining all factors
-        double cost = std_dev + norm_conflict + empty_ratio;
+        // Balance prediction conflict cost against memory oversubscription.
+        double cost = std_dev + norm_conflict + memory_penalty;
 
         return {cost, slot_counts};
     }

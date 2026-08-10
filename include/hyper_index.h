@@ -213,6 +213,8 @@ public:
     void convertSearchNodeToModelNode(SearchInnerNode* sNode, void* parentNode);
 
 private:
+    std::optional<ValueType> findOnce(KeyType key, bool allow_retry) const;
+
     std::vector<std::pair<KeyType, ValueType>> rangeQuery(KeyType left, KeyType right,
                                                           size_t limit) const;
 

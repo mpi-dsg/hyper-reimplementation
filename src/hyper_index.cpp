@@ -86,38 +86,35 @@ void Hyper::bulkLoad(const std::vector<std::pair<KeyType, ValueType>>& data) {
 
 
 std::optional<ValueType> Hyper::find(KeyType key) const {
+    return findOnce(key, /*allow_retry=*/true);
+}
+
+std::optional<ValueType> Hyper::findOnce(KeyType key, bool allow_retry) const {
     EPOCH_GUARD();
 
     void* cur = root_.load(std::memory_order_acquire);
+    if (cur == nullptr) return std::nullopt;
 
-    // Traverse the tree to find the leaf node containing the key
     while (!isLeafNode(cur)) {
         if (isModelInnerNode(cur)) {
-            auto* modelNode = taggedCast<ModelInnerNode>(cur);
-            void* nextNode = modelNode->findChild(key);
-            __builtin_prefetch(nextNode, 0, 3);
-            cur = nextNode;
+            cur = taggedCast<ModelInnerNode>(cur)->findChild(key);
         } else if (isSearchInnerNode(cur)) {
-            auto* searchNode = taggedCast<SearchInnerNode>(cur);
-            void* nextNode = searchNode->findChild(key);
-            __builtin_prefetch(nextNode, 0, 3);
-            cur = nextNode;
+            cur = taggedCast<SearchInnerNode>(cur)->findChild(key);
         } else {
-            return std::nullopt;  // Unknown node type
+            return std::nullopt;
         }
+        if (cur == nullptr) return std::nullopt;
     }
 
-    // Search within the leaf node
-    auto* leaf = taggedCast<LeafNode>(cur);
-    auto result = leaf->find(key);
+    auto result = taggedCast<LeafNode>(cur)->find(key);
+    if (!result.has_value()) return std::nullopt;
 
-    // Special handling for sentinel values
+    // Sentinel payload: keys 0 / 2^63 are placeholders; other keys may land on a
+    // wrong leaf after SMO — retry once from the root.
     if (*result == std::numeric_limits<ValueType>::max()) {
-        if ((key == 0) | (key == (1ULL << 63))) {
-            return std::nullopt;
-        } else if (key != std::numeric_limits<KeyType>::max()) {
-            find(key);
-        }
+        if (key == 0 || key == (1ULL << 63)) return std::nullopt;
+        if (allow_retry) return findOnce(key, false);
+        return std::nullopt;
     }
     return result;
 }
@@ -366,13 +363,16 @@ InsertResult Hyper::insertAttempt(KeyType key, ValueType value) {
                 // Check if we need to update root
                 if (parent == nullptr || needsRootUpdate(rootSnapshot, (*insertReturn.splitDescriptors)[0])) {
                     // We need to update the root using RCU
-                    return handleRootUpdate(rootSnapshot, *insertReturn.splitDescriptors);
+                    auto rr = handleRootUpdate(rootSnapshot, *insertReturn.splitDescriptors);
+                    if (insertReturn.smo_leaf) insertReturn.smo_leaf->endSmo();
+                    return rr;
                 } else {
-                    // Normal split, insert descriptors
+                    // Normal split, insert descriptors (old leaf still readable).
                     std::unique_lock<HyperSlotMutex> parentLock;
                     insertLeafDescriptors(*insertReturn.splitDescriptors, parentLock);
                 }
             }
+            if (insertReturn.smo_leaf) insertReturn.smo_leaf->endSmo();
             return InsertResult::Success;
             
         case InsertResult::RetryFromRoot:
@@ -581,51 +581,50 @@ std::vector<std::pair<KeyType, ValueType>> Hyper::rangeQuery(KeyType left, KeyTy
             isFirstLeaf = false;
         }
 
-        // Only scan from the computed start position
+        // Collect matches from this leaf, then sort so overflow buffers do not
+        // break key order within the leaf (scan locality).
+        std::vector<std::pair<KeyType, ValueType>> leaf_hits;
+        bool past_right = false;
         for (size_t i = startSlot; i < leaf->getSlots().size(); i++) {
             const auto& slot = leaf->getSlots()[i];
 
-            // Process single key-value pair
             if (slot.isKV()) {
                 KeyType key = leaf->decodeKey(slot.data.kv.key);
                 if (key >= left && key <= right) {
-                    result.emplace_back(key, slot.data.kv.value);
-                    if (result.size() >= limit) {
-                        rightBoundaryHit = true;
-                        break;
-                    }
+                    leaf_hits.emplace_back(key, slot.data.kv.value);
                 }
                 if (key > right) {
-                    rightBoundaryHit = true;
+                    past_right = true;
                     break;
                 }
             } else if (slot.isPointer() && slot.data.overflowPtr) {
-                const auto& buffer_data = slot.data.overflowPtr.load(std::memory_order_acquire)->data();
-
-                auto startIter = buffer_data.begin();
-                if (isFirstLeaf) {
-                    startIter = std::lower_bound(buffer_data.begin(), buffer_data.end(), left,
-                                                 [](const auto& pair, const KeyType key) {
-                                                     return pair.first < key;
-                                                 });
-                }
-
+                OverflowBuffer* buf = slot.data.overflowPtr.load(std::memory_order_acquire);
+                if (!buf) continue;
+                const auto& buffer_data = buf->data();
+                auto startIter = std::lower_bound(
+                    buffer_data.begin(), buffer_data.end(), left,
+                    [](const auto& pair, const KeyType key) { return pair.first < key; });
                 for (auto it = startIter; it != buffer_data.end(); ++it) {
                     if (it->first <= right) {
-                        result.push_back(*it);
-                        if (result.size() >= limit) {
-                            rightBoundaryHit = true;
-                            break;
-                        }
+                        leaf_hits.push_back(*it);
                     } else {
-                        rightBoundaryHit = true;
+                        past_right = true;
                         break;
                     }
                 }
-
-                if (rightBoundaryHit) break;
+                if (past_right) break;
             }
         }
+        std::sort(leaf_hits.begin(), leaf_hits.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& kv : leaf_hits) {
+            result.push_back(kv);
+            if (result.size() >= limit) {
+                rightBoundaryHit = true;
+                break;
+            }
+        }
+        if (past_right) rightBoundaryHit = true;
 
         if (rightBoundaryHit) break;
 

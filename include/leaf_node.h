@@ -19,6 +19,8 @@ constexpr KeyType MSB_MASK = 1ULL << 63;
 /// Paper §6.1 / §3.3.1: Policy 1 conflict threshold \(C^{max}_{leaf}\).
 constexpr size_t kMaxLeafConflicts = 256;
 
+class LeafNode;
+
 /**
  * @enum InsertResult
  * @brief Result codes for insert operations
@@ -36,10 +38,14 @@ enum class InsertResult {
 struct InsertReturn {
     InsertResult result;
     std::optional<std::vector<std::pair<KeyType, void*>>> splitDescriptors;
-    
+    /// When set, caller must invoke endSmo() after parent updates (§4.2.2).
+    LeafNode* smo_leaf = nullptr;
+
     InsertReturn(InsertResult res) : result(res) {}
-    InsertReturn(InsertResult res, std::vector<std::pair<KeyType, void*>>&& splits) 
+    InsertReturn(InsertResult res, std::vector<std::pair<KeyType, void*>>&& splits)
         : result(res), splitDescriptors(std::move(splits)) {}
+    InsertReturn(InsertResult res, std::vector<std::pair<KeyType, void*>>&& splits, LeafNode* leaf)
+        : result(res), splitDescriptors(std::move(splits)), smo_leaf(leaf) {}
 };
 
 /**
@@ -263,6 +269,11 @@ public:
      */
     bool tryRetrainInPlace(double delta);
 
+    /**
+     * @brief Release the SMO lock held across split + parent reinsert (§4.2.2).
+     */
+    void endSmo();
+
 private:
     /**
      * @brief Predicts the slot position for a given key using the linear model
@@ -317,9 +328,16 @@ private:
     KeyType maxPossibleKey_;         // Maximum possible key for this node
     std::vector<Slot> slots_;        // Array of slots for storing data
 
-    // Paper §3.3.1: 16-bit op counter; wrap triggers Policy 2 check.
-    std::atomic<uint16_t> op_counter_;
+    // Paper §3.3.1: 16-bit op counter packed in the high bits of a pointer word.
+    static constexpr unsigned kOpCounterShift = 48;
+    std::atomic<uintptr_t> op_counter_ptr_{0};
     std::vector<int> init_histogram_; // Initial key distribution histogram
+
+    // Held from leaf split gather through parent descriptor install (MT).
+    std::mutex smo_lock_;
+    bool smo_held_ = false;
+
+    bool bumpOpCounterWrapped();
 };
 
 #endif // HYPERCODE_LEAF_NODE_H

@@ -65,12 +65,12 @@ void LeafNode::Slot::setOverflow(KeyType k, ValueType v) {
 LeafNode::LeafNode(double slope, KeyType minKey, KeyType maxKey)
         : slope_(slope), minKey_(minKey), maxPossibleKey_(std::numeric_limits<KeyType>::max()),
           MR_(ceil(slope * static_cast<double>(maxKey - minKey))), slots_(MR_+1),
-          op_counter_(0), init_histogram_(MR_+1, 0) {}
+          op_counter_ptr_(0), init_histogram_(MR_+1, 0) {}
 
 LeafNode::LeafNode(const LeafNode& other)
         : slope_(other.slope_), minKey_(other.minKey_), maxPossibleKey_(other.maxPossibleKey_),
           MR_(other.MR_), slots_(other.MR_ + 1),
-          op_counter_(other.op_counter_.load()), init_histogram_(other.init_histogram_) {
+          op_counter_ptr_(other.op_counter_ptr_.load()), init_histogram_(other.init_histogram_) {
 
     // Deep copy all slots (locks are initialized fresh)
     for (size_t i = 0; i < other.slots_.size(); ++i) {
@@ -222,9 +222,8 @@ InsertReturn LeafNode::insert(
         slotLock.unlock();
     }
 
-    // Policy 2: check KS divergence when the 16-bit op counter wraps.
-    uint16_t prev = op_counter_.fetch_add(1, std::memory_order_relaxed);
-    if (static_cast<uint16_t>(prev + 1) == 0 && checkPolicyTwo()) {
+    // Policy 2: 16-bit counter in pointer word; wrap triggers KS check.
+    if (bumpOpCounterWrapped() && checkPolicyTwo()) {
         needsRetrain = true;
     }
 
@@ -239,12 +238,36 @@ InsertReturn LeafNode::insert(
         return InsertReturn(InsertResult::Success);
     }
 
-    auto splitResult = performSplitWithParentLock(delta);
-    if (splitResult.has_value()) {
-        return InsertReturn(InsertResult::SuccessWithSplit, std::move(*splitResult));
+    // §4.2.2: hold SMO lock so readers still see this leaf until parents updated.
+    if (isHyperLockingEnabled()) {
+        smo_lock_.lock();
+        smo_held_ = true;
     }
 
+    auto splitResult = performSplitWithParentLock(delta);
+    if (splitResult.has_value()) {
+        return InsertReturn(InsertResult::SuccessWithSplit, std::move(*splitResult),
+                            smo_held_ ? this : nullptr);
+    }
+    if (smo_held_) {
+        endSmo();
+    }
     return InsertReturn(InsertResult::Success);
+}
+
+bool LeafNode::bumpOpCounterWrapped() {
+    // Increment the 16-bit field stored in the high bits of a pointer-sized word.
+    const uintptr_t prev = op_counter_ptr_.fetch_add(
+        uintptr_t(1) << kOpCounterShift, std::memory_order_relaxed);
+    const uint16_t before = static_cast<uint16_t>(prev >> kOpCounterShift);
+    return before == 0xFFFF;
+}
+
+void LeafNode::endSmo() {
+    if (smo_held_) {
+        smo_held_ = false;
+        smo_lock_.unlock();
+    }
 }
 
 std::optional<ValueType> LeafNode::find(KeyType key) const {
@@ -376,7 +399,7 @@ size_t LeafNode::memoryBytes() const {
 void LeafNode::bulkLoad(std::vector<std::pair<KeyType, ValueType>>&& data) {
     // Initialize histograms and counters
     init_histogram_.assign(slots_.size(), 0);
-    op_counter_.store(0, std::memory_order_relaxed);
+    op_counter_ptr_.store(0, std::memory_order_relaxed);
 
     size_t n = data.size();
     size_t i = 0;
@@ -632,7 +655,7 @@ bool LeafNode::checkPolicyTwo() {
     for (int x : init_histogram_) n += x;
     for (int x : current_hist) m += x;
     if (n <= 0 || m <= 0) {
-        op_counter_.store(0, std::memory_order_relaxed);
+        op_counter_ptr_.store(0, std::memory_order_relaxed);
         return false;
     }
 
@@ -651,6 +674,6 @@ bool LeafNode::checkPolicyTwo() {
     const double c_beta = std::sqrt(-0.5 * std::log(0.005 / 2.0));
     double threshold = c_beta * std::sqrt((n + m) / static_cast<double>(n * m));
 
-    op_counter_.store(0, std::memory_order_relaxed);
+    op_counter_ptr_.store(0, std::memory_order_relaxed);
     return d_stat > threshold;
 }
