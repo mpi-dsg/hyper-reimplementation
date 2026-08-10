@@ -938,46 +938,67 @@ void Hyper::collectAllData(void* node, std::vector<std::pair<KeyType, ValueType>
 }
 
 void Hyper::convertSearchNodeToModelNode(SearchInnerNode* sNode, void* parentNode) {
+    // Convert S-inner → M-inner from existing children (paper §3.3.2). Parent may be
+    // null (root), ModelInner, or SearchInner — never assume ModelInner.
+    auto children = sNode->getChildren();
+    if (children.size() <= 1) return;
+    KeyType boundary = children.front().first;
+    void* taggedNew = buildInnerFromChildren(children);
+
+    auto abandonNewInner = [&](void* node) {
+        if (node == nullptr || isLeafNode(node)) return;
+        if (isModelInnerNode(node)) {
+            taggedCast<ModelInnerNode>(node)->disownChildren();
+            delete taggedCast<ModelInnerNode>(node);
+        } else if (isSearchInnerNode(node)) {
+            taggedCast<SearchInnerNode>(node)->disownChildren();
+            delete taggedCast<SearchInnerNode>(node);
+        }
+    };
+
     std::unique_lock<HyperSlotMutex> parentLock;
-    KeyType searchNodeKey = 0; // Will store the key for this search node in parent
-
-    // Parent is a model inner node - find and lock the appropriate slot
-    auto* modelParent = taggedCast<ModelInnerNode>(parentNode);
-
-    // Find which slot contains this search node
-    size_t slotIdx = 0;
     void* taggedSearchNode = tagPointer(sNode, NodeType::SearchInner);
 
-    for (size_t i = 0; i < modelParent->getNumSlots(); i++) {
-        void* child = modelParent->getChildAtIndex(i);
-        if (child == taggedSearchNode) {
-            slotIdx = i;
-            break;
+    if (parentNode == nullptr) {
+        if (!updateRootRCU(taggedSearchNode, taggedNew)) {
+            abandonNewInner(taggedNew);
+            return;
         }
-    }
-
-    if (isHyperLockingEnabled()) {
-        parentLock = std::unique_lock<HyperSlotMutex>(modelParent->getSlotLock(slotIdx));
-    }
-
-    // Get the key for this search node (needed for updating parent)
-    const auto& slot = modelParent->getSlots()[slotIdx];
-    if (slot.isRealChild()) {
-        searchNodeKey = slot.KeyChildPtr.first;
-    }
-
-    // Collect all data (must pass a tagged pointer — collectAllData dispatches on tag bits)
-    std::vector<std::pair<KeyType, ValueType>> subtreeData;
-    collectAllData(taggedSearchNode, subtreeData);
-
-    std::vector<std::pair<KeyType, void*>> newLeaves = buildLeaves(std::move(subtreeData));
-    if (newLeaves.empty()) {
+        sNode->disownChildren();
+        safeDelete(sNode);
         return;
     }
-    KeyType boundary = newLeaves.front().first;
-    void* taggedNewModelNode = buildInnerFromChildren(newLeaves);
 
-    modelParent->updateChildWithExternalLock(boundary, taggedNewModelNode);
+    if (isModelInnerNode(parentNode)) {
+        auto* modelParent = taggedCast<ModelInnerNode>(parentNode);
+        size_t slotIdx = 0;
+        bool found = false;
+        for (size_t i = 0; i < modelParent->getNumSlots(); i++) {
+            if (modelParent->getChildAtIndex(i) == taggedSearchNode) {
+                slotIdx = i;
+                found = true;
+                break;
+            }
+        }
+        if (found && isHyperLockingEnabled()) {
+            parentLock = std::unique_lock<HyperSlotMutex>(modelParent->getSlotLock(slotIdx));
+        }
+        if (found && modelParent->getSlots()[slotIdx].isRealChild()) {
+            boundary = modelParent->getSlots()[slotIdx].KeyChildPtr.first;
+        }
+        modelParent->updateChildWithExternalLock(boundary, taggedNew);
+    } else if (isSearchInnerNode(parentNode)) {
+        auto* searchParent = taggedCast<SearchInnerNode>(parentNode);
+        if (isHyperLockingEnabled()) {
+            parentLock = std::unique_lock<HyperSlotMutex>(searchParent->structural_lock_);
+        }
+        searchParent->addChild(boundary, taggedNew);
+    } else {
+        abandonNewInner(taggedNew);
+        return;
+    }
+
+    sNode->disownChildren();
     safeDelete(sNode);
 }
 
