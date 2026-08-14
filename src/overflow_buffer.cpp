@@ -1,118 +1,129 @@
 #include "../include/overflow_buffer.h"
+#include <stdexcept>
+
+size_t OverflowBuffer::clamp_cap(size_t cap) {
+    if (cap == 0) return kDefaultCapacity;
+    if (cap > kMaxCapacity) return kMaxCapacity;
+    return cap;
+}
 
 OverflowBuffer::OverflowBuffer(size_t capacity) {
-    buffer_.reserve(capacity);
+    ensure_capacity(clamp_cap(capacity));
 }
 
-OverflowBuffer::OverflowBuffer() = default;
+OverflowBuffer::OverflowBuffer() {
+    ensure_capacity(kDefaultCapacity);
+}
 
-OverflowBuffer::OverflowBuffer(const OverflowBuffer& other) : buffer_(other.buffer_) {}
+OverflowBuffer::OverflowBuffer(const OverflowBuffer& other)
+        : size_(other.size_), cap_(0), pairs_(nullptr) {
+    if (other.cap_ == 0) return;
+    ensure_capacity(other.cap_);
+    if (size_ > 0) {
+        std::memcpy(pairs_, other.pairs_, size_ * sizeof(Pair));
+    }
+}
 
 OverflowBuffer::~OverflowBuffer() {
-    buffer_.clear();
+    delete[] pairs_;
+    pairs_ = nullptr;
+    size_ = 0;
+    cap_ = 0;
 }
 
-auto OverflowBuffer::find_position(KeyType key) {
-    // Binary search to find the position where key should be
-    return std::lower_bound(buffer_.begin(), buffer_.end(), key,
-                            [](const auto& pair, const KeyType& k) {
-                                return pair.first < k;
-                            });
+void OverflowBuffer::ensure_capacity(size_t min_cap) {
+    min_cap = clamp_cap(min_cap);
+    if (cap_ >= min_cap) return;
+    size_t neu_cap = cap_ == 0 ? min_cap : cap_;
+    while (neu_cap < min_cap) {
+        size_t next = neu_cap * 2;
+        if (next > kMaxCapacity || next < neu_cap) {
+            neu_cap = kMaxCapacity;
+            break;
+        }
+        neu_cap = next;
+    }
+    auto* neu = new Pair[neu_cap];
+    if (pairs_ && size_ > 0) {
+        std::memcpy(neu, pairs_, size_ * sizeof(Pair));
+    }
+    delete[] pairs_;
+    pairs_ = neu;
+    cap_ = static_cast<uint16_t>(neu_cap);
 }
 
-auto OverflowBuffer::find_position(KeyType key) const {
-    // Binary search to find the position where key should be (const version)
-    return std::lower_bound(buffer_.begin(), buffer_.end(), key,
-                            [](const auto& pair, const KeyType& k) {
-                                return pair.first < k;
-                            });
+OverflowBuffer::Pair* OverflowBuffer::lower_bound_key(KeyType key) {
+    return std::lower_bound(pairs_, pairs_ + size_, key,
+                            [](const Pair& p, KeyType k) { return p.first < k; });
+}
+
+const OverflowBuffer::Pair* OverflowBuffer::lower_bound_key(KeyType key) const {
+    return std::lower_bound(pairs_, pairs_ + size_, key,
+                            [](const Pair& p, KeyType k) { return p.first < k; });
 }
 
 void OverflowBuffer::insert(KeyType key, ValueType value) {
-    // Find the position where the key should be inserted
-    auto it = find_position(key);
-
-    // If the key already exists, update its value
-    if (it != buffer_.end() && it->first == key) {
-        it->second = value;
-    } else {
-        // Insert the new key-value pair at the found position
-        buffer_.emplace(it, key, value);
+    Pair* it = lower_bound_key(key);
+    size_t pos = static_cast<size_t>(it - pairs_);
+    if (pos < size_ && pairs_[pos].first == key) {
+        pairs_[pos].second = value;
+        return;
     }
+    if (size_ >= kMaxCapacity) {
+        // Corollary 3.1: leaf must split before capacity is exceeded. Never
+        // silently drop/overwrite a different key (that creates miss rates).
+        throw std::runtime_error("OverflowBuffer insert exceeds 2δ+1 capacity");
+    }
+    ensure_capacity(size_ + 1);
+    if (pos < size_) {
+        std::memmove(pairs_ + pos + 1, pairs_ + pos, (size_ - pos) * sizeof(Pair));
+    }
+    pairs_[pos] = {key, value};
+    ++size_;
 }
 
 OverflowBuffer* OverflowBuffer::insertRCU(KeyType key, ValueType value) const {
-    // Create a new copy of the buffer
-    OverflowBuffer* newBuffer = new OverflowBuffer(*this);
-
-    // Find the position where the key should be inserted
-    auto it = newBuffer->find_position(key);
-
-    // If the key already exists, update its value
-    if (it != newBuffer->buffer_.end() && it->first == key) {
-        it->second = value;
-    } else {
-        // Insert the new key-value pair at the found position
-        newBuffer->buffer_.emplace(it, key, value);
-    }
-
-    return newBuffer;
+    auto* neu = new OverflowBuffer(*this);
+    neu->insert(key, value);
+    return neu;
 }
 
 std::optional<ValueType> OverflowBuffer::find(KeyType key) const {
-    // Find the position of the key
-    auto it = find_position(key);
-
-    // Check if the key exists
-    if (it != buffer_.end() && it->first == key) {
-        return it->second;
-    }
-
-    // Key not found
+    const Pair* it = lower_bound_key(key);
+    size_t pos = static_cast<size_t>(it - pairs_);
+    if (pos < size_ && pairs_[pos].first == key) return pairs_[pos].second;
     return std::nullopt;
 }
 
 bool OverflowBuffer::erase(KeyType key) {
-    // Find the position of the key
-    auto it = find_position(key);
-
-    // Check if the key exists
-    if (it != buffer_.end() && it->first == key) {
-        // Remove the key-value pair
-        buffer_.erase(it);
-        return true;
+    Pair* it = lower_bound_key(key);
+    size_t pos = static_cast<size_t>(it - pairs_);
+    if (pos >= size_ || pairs_[pos].first != key) return false;
+    if (pos + 1 < size_) {
+        std::memmove(pairs_ + pos, pairs_ + pos + 1, (size_ - pos - 1) * sizeof(Pair));
     }
-
-    // Key not found
-    return false;
+    --size_;
+    return true;
 }
 
 OverflowBuffer* OverflowBuffer::eraseRCU(KeyType key) const {
-    // Find the position of the key
-    auto it = find_position(key);
+    if (!find(key).has_value()) return nullptr;
+    auto* neu = new OverflowBuffer(*this);
+    neu->erase(key);
+    return neu;
+}
 
-    // Check if the key exists
-    if (it != buffer_.end() && it->first == key) {
-        // Create a new copy without the key
-        OverflowBuffer* newBuffer = new OverflowBuffer(*this);
-        auto new_it = newBuffer->find_position(key);
-        newBuffer->buffer_.erase(new_it);
-        return newBuffer;
+std::vector<OverflowBuffer::Pair> OverflowBuffer::get_all() const {
+    return std::vector<Pair>(pairs_, pairs_ + size_);
+}
+
+void OverflowBuffer::bulk_load(std::vector<Pair>&& data) {
+    size_ = 0;
+    if (data.empty()) return;
+    if (data.size() > kMaxCapacity) {
+        throw std::runtime_error("OverflowBuffer bulk_load exceeds 2δ+1 capacity");
     }
-
-    // Key not found
-    return nullptr;
-}
-
-size_t OverflowBuffer::size() const {
-    return buffer_.size();
-}
-
-std::vector<std::pair<KeyType, ValueType>> OverflowBuffer::get_all() const {
-    return buffer_;
-}
-
-void OverflowBuffer::bulk_load(std::vector<std::pair<KeyType, ValueType>>&& data) {
-    // Move all key-value pairs and ensure they're sorted
-    buffer_ = std::move(data);
+    ensure_capacity(data.size());
+    std::memcpy(pairs_, data.data(), data.size() * sizeof(Pair));
+    size_ = static_cast<uint16_t>(data.size());
 }

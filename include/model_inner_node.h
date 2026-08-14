@@ -12,7 +12,9 @@
 #include <mutex>
 #include <atomic>
 #include <set>
+#include <memory>
 #include <set>
+#include <memory>
 
 /**
  * @class ModelInnerNode
@@ -29,98 +31,35 @@ public:
      * @brief Represents a slot in the model inner node with optimized memory usage
      */
     struct Slot {
+        // Paper-like 16B cell: real (key,child) or duplicate child ptr.
         union {
             std::pair<KeyType, void*> KeyChildPtr;
             struct {
-                void* childPtr;      // 64 bits - Direct pointer to child (for duplicates)
-                uint64_t stateBits;  // 64 bits - 0 means duplicate, non-zero means real child
+                void* childPtr;
+                uint64_t stateBits;  // 0 => duplicate
             } dupData{};
         };
 
-        mutable std::mutex lock;                        // writer synchronization
-        mutable std::atomic<uint64_t> version{0};    // seq lock version counter
-
-        /**
-         * @brief Constructor initializes a slot as a duplicate with null pointer
-         */
         Slot() {
-            // Initialize as duplicate with null pointer
             dupData.childPtr = nullptr;
-            dupData.stateBits = 0; // 0 means duplicate
+            dupData.stateBits = 0;
         }
-
-        /**
-         * @brief Destructor properly cleans up based on the slot type
-         */
         ~Slot() {
             if (isRealChild()) {
                 KeyChildPtr.~pair();
             }
         }
-
-        /**
-         * @brief Checks if this slot contains a real child pointer
-         * @return true if contains a real child, false if duplicate
-         */
-        bool isRealChild() const {
-            return dupData.stateBits != 0;
-        }
-
-        /**
-         * @brief Sets this slot as a real child with the given key and pointer
-         * @param key Key for the child node
-         * @param ptr Pointer to the child node
-         */
+        bool isRealChild() const { return dupData.stateBits != 0; }
         void setRealChild(KeyType key, void* ptr) {
             new (&KeyChildPtr) std::pair<KeyType, void*>(key, ptr);
         }
-
-        /**
-         * @brief Sets this slot as a duplicate with direct child pointer
-         * @param childPtr Direct pointer to the child node
-         */
         void setDuplicate(void* childPtr) {
             dupData.childPtr = childPtr;
-            dupData.stateBits = 0; // 0 means duplicate
+            dupData.stateBits = 0;
         }
-
-        /**
-         * @brief Gets the direct child pointer from duplicate slot
-         * @return Direct pointer to the child node
-         */
-        void* getChildPtr() const {
-            return dupData.childPtr;
-        }
-
-        /**
-         * @brief Gets the current version of this slot
-         * @return Current version
-         */
-        uint64_t getVersion() const {
-            return version.load(std::memory_order_acquire);
-        }
-
-        /**
-         * @brief Increments the version counter (for writers)
-         */
-        void incrementVersion() {
-            version.fetch_add(1, std::memory_order_release);
-        }
-
-        /**
-         * @brief Begins a write operation by incrementing version to odd number
-         */
-        void beginWrite() {
-            version.fetch_add(1, std::memory_order_release);
-        }
-
-        /**
-         * @brief Ends a write operation by incrementing version to even number
-         */
-        void endWrite() {
-            version.fetch_add(1, std::memory_order_release);
-        }
+        void* getChildPtr() const { return dupData.childPtr; }
     };
+    static_assert(sizeof(Slot) == 16, "ModelInner slot must be 16 bytes");
 
     /**
      * @brief Constructs a model inner node
@@ -212,6 +151,18 @@ public:
     bool shouldRebuild() const;
 
     /**
+     * @brief Collect unique real children as (boundaryKey, taggedPtr), sorted by key.
+     *        Used for paper §3.3.2 M-inner rebuild (no leaf data rewrite).
+     */
+    std::vector<std::pair<KeyType, void*>> collectSortedChildren() const;
+
+    /**
+     * @brief Null out child pointers so the destructor does not free the subtree.
+     *        Call after children have been re-parented under a replacement node.
+     */
+    void disownChildren();
+
+    /**
      * @brief Gets all slots in the node for efficient rebuilding
      * @return Reference to the slot vector
      */
@@ -235,17 +186,15 @@ public:
      * @param idx Index of the slot
      * @return Reference to the slot's lock
      */
-    std::mutex& getSlotLock(size_t idx) {
-        return slots_[idx].lock;
+    HyperSlotMutex& getSlotLock(size_t idx) {
+        if (slot_locks_) return slot_locks_[idx];
+        static HyperSlotMutex kDummy;  // ST: no-op mutex
+        return kDummy;
     }
+    bool hasSlotLocks() const { return static_cast<bool>(slot_locks_); }
 
-    /**
-     * @brief Gets the version counter for a specific slot
-     * @param idx Index of the slot
-     * @return Current version of the slot
-     */
     uint64_t getSlotVersion(size_t idx) const {
-        return slots_[idx].getVersion();
+        return slot_versions_ ? slot_versions_[idx].load(std::memory_order_acquire) : 0;
     }
 
     /**
@@ -253,7 +202,7 @@ public:
      * @param key Key to find child for
      * @return Tuple of {lock, child_pointer, slot_index}
      */
-    std::tuple<std::unique_lock<std::mutex>, void*, size_t> findChildWithLock(KeyType key);
+    std::tuple<std::unique_lock<HyperSlotMutex>, void*, size_t> findChildWithLock(KeyType key);
 
     /**
     * @brief Checks if all slots are unlocked
@@ -334,9 +283,20 @@ private:
     KeyType minKey_;                     ///< Minimum key in the subtree
     size_t MR_;                          ///< Maximum range of slots
     std::vector<Slot> slots_;            ///< Array of slots for child pointers
+    // MT-only side arrays (ST: zero lock/version footprint per slot).
+    std::unique_ptr<HyperSlotMutex[]> slot_locks_;
+    std::unique_ptr<std::atomic<uint64_t>[]> slot_versions_;
 
-    std::atomic<size_t> initial_leaf_node_count_{0};      ///< Initial number of leaf nodes for rebuild detection
-    std::atomic<size_t> leaf_node_count_{0};              ///< Current number of leaf nodes in the subtree
+    void beginWrite(size_t idx) {
+        if (slot_versions_) slot_versions_[idx].fetch_add(1, std::memory_order_release);
+    }
+    void endWrite(size_t idx) {
+        if (slot_versions_) slot_versions_[idx].fetch_add(1, std::memory_order_release);
+    }
+    void fillLeadingDuplicates();
+
+    std::atomic<size_t> initial_leaf_node_count_{0};
+    std::atomic<size_t> leaf_node_count_{0};
 };
 
 #endif // HYPERCODE_MODEL_INNER_NODE_H

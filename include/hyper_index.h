@@ -41,6 +41,17 @@ public:
               max_node_size_(max_node_size) {}
 
     /**
+     * @brief Enable/disable fine-grained locking (paper §6.1).
+     *
+     * Single-thread evaluations in the paper disable locking. Default is on.
+     */
+    static void setLockingEnabled(bool enabled) {
+        setHyperLockingEnabled(enabled);
+    }
+
+    static bool lockingEnabled() { return isHyperLockingEnabled(); }
+
+    /**
      * @brief Destructor for cleaning up the index
      */
     ~Hyper();
@@ -73,11 +84,57 @@ public:
     void insert(KeyType key, ValueType value);
 
     /**
+     * @brief Deletes a key from the index (Hyper paper §4.4).
+     *
+     * Locates the leaf, removes the entry, leaves leftmost-key metadata
+     * unchanged when the deleted key was the leaf minimum, and rebuilds the
+     * leaf in place if its density falls below @ref kMinLeafDensity.
+     *
+     * @param key Key to delete
+     * @return true if the key was present and removed
+     */
+    bool erase(KeyType key);
+
+    /**
+     * @brief Update an existing key's value (§4.4). Does not insert missing keys.
+     * @return true if the key was present and updated
+     */
+    bool update(KeyType key, ValueType value);
+
+    /// Lower density ratio that triggers an in-leaf rebuild after delete (§4.4).
+    static constexpr double kMinLeafDensity = 0.25;
+
+    /**
+     * @brief Memory breakdown matching the paper's "index size" vs "total size"
+     *        reporting (Fig. 11): index = inner structure; total includes leaves.
+     *
+     * Sizes are structural estimates (sizeof + heap payloads we own), not RSS.
+     */
+    struct MemoryStats {
+        size_t index_bytes = 0;  ///< Inner nodes (model + search) and their slots
+        size_t leaf_bytes = 0;   ///< Leaf nodes, overflow buffers, KV payloads
+        size_t total_bytes() const { return index_bytes + leaf_bytes; }
+    };
+
+    /**
+     * @brief Compute structural memory consumption of the live index tree.
+     */
+    MemoryStats memoryStats() const;
+
+    /// Convenience: total structural bytes (index + leaves).
+    size_t memoryBytes() const { return memoryStats().total_bytes(); }
+
+    /**
      * @brief Inserts multiple leaf node descriptors into the index
      * @param leafDescs Vector of key-leaf pairs to insert
      */
     void insertLeafDescriptors(const std::vector<std::pair<KeyType, void*>>& leafDescs,
-                               std::unique_lock<std::mutex>& parentLock);
+                               std::unique_lock<HyperSlotMutex>& parentLock);
+
+    /**
+     * @brief Scan up to @p limit keys starting at @p start (inclusive).
+     */
+    std::vector<std::pair<KeyType, ValueType>> scan(KeyType start, size_t limit) const;
 
     /**
      * @brief Executes a range query to find all key-value pairs in a range
@@ -113,7 +170,8 @@ public:
      * @return Vector of key-leaf pairs
      */
     std::vector<std::pair<KeyType, void*>> buildLeavesForPartition(
-            const std::vector<std::pair<KeyType, ValueType>>&& data);
+            const std::vector<std::pair<KeyType, ValueType>>&& data,
+            KeyType partition_max_key = std::numeric_limits<KeyType>::max());
 
     /**
      * @brief Builds leaf nodes for a set of data
@@ -122,6 +180,17 @@ public:
      */
     std::vector<std::pair<KeyType, void*>> buildLeaves(
             const std::vector<std::pair<KeyType, ValueType>>&& data);
+
+    /**
+     * @brief Build an inner subtree from sorted child descriptors (Algo 1 +
+     *        configuration search). Enforces max_node_size_ and rebalance.
+     */
+    void* buildInnerFromChildren(std::vector<std::pair<KeyType, void*>>& children);
+
+    /**
+     * @brief Estimated structural bytes for an M-inner covering @p n_keys children.
+     */
+    size_t estimateModelNodeBytes(size_t n_keys) const;
 
     /**
      * @brief Rebuilds a model inner node
@@ -145,6 +214,11 @@ public:
     void convertSearchNodeToModelNode(SearchInnerNode* sNode, void* parentNode);
 
 private:
+    std::optional<ValueType> findOnce(KeyType key, bool allow_retry) const;
+
+    std::vector<std::pair<KeyType, ValueType>> rangeQuery(KeyType left, KeyType right,
+                                                          size_t limit) const;
+
     std::atomic<void*> root_{nullptr};        ///< Root node of the index
     std::mutex root_update_lock_;             ///< Lock only for root updates, not traversals
     double delta_;                            ///< Error bound for PLA
@@ -185,6 +259,12 @@ private:
      * @return InsertResult indicating success or retry needed
      */
     InsertResult handleRootUpdate(void* oldRoot, const std::vector<std::pair<KeyType, void*>>& splitDescriptors);
+
+    /**
+     * @brief Recursively accumulate MemoryStats for a tagged subtree.
+     */
+    void accumulateMemory(void* node, MemoryStats& stats,
+                          std::set<void*>& visited_nodes) const;
 };
 
 // Include node implementations after the Hyper class is defined

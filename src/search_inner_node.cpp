@@ -18,8 +18,17 @@ SearchInnerNode::~SearchInnerNode() {
     children_.clear();
 }
 
+void SearchInnerNode::disownChildren() {
+    for (auto& entry : children_) {
+        entry.childPtr = nullptr;
+    }
+}
+
 void SearchInnerNode::addChild(KeyType boundaryKey, void* child) {
-    std::lock_guard<std::mutex> guard(structural_lock_);
+    std::unique_lock<HyperSlotMutex> guard(structural_lock_, std::defer_lock);
+    if (isHyperLockingEnabled()) {
+        guard.lock();
+    }
 
     incrementVersion();
 
@@ -40,6 +49,38 @@ void SearchInnerNode::addChild(KeyType boundaryKey, void* child) {
     }
 
     incrementVersion();
+}
+
+bool SearchInnerNode::replaceChildPtr(void* oldChild, KeyType boundaryKey, void* newChild) {
+    std::unique_lock<HyperSlotMutex> guard(structural_lock_, std::defer_lock);
+    if (isHyperLockingEnabled()) {
+        guard.lock();
+    }
+
+    incrementVersion();
+    for (auto& entry : children_) {
+        if (entry.childPtr == oldChild) {
+            entry.childPtr = newChild;
+            // Keep the existing boundary unless caller wants a tighter one.
+            if (boundaryKey < entry.boundaryKey) {
+                entry.boundaryKey = boundaryKey;
+            }
+            incrementVersion();
+            return true;
+        }
+    }
+    // Fallback: insert under the provided boundary.
+    auto it = std::lower_bound(children_.begin(), children_.end(), boundaryKey,
+                               [](const ChildEntry& entry, const KeyType& key) {
+                                   return entry.boundaryKey < key;
+                               });
+    if (it != children_.end() && it->boundaryKey == boundaryKey) {
+        it->childPtr = newChild;
+    } else {
+        children_.emplace(it, boundaryKey, newChild);
+    }
+    incrementVersion();
+    return false;
 }
 
 void* SearchInnerNode::findChild(KeyType key) const {
@@ -113,14 +154,15 @@ void* SearchInnerNode::getChildAtIndex(int idx) const {
 }
 
 std::pair<std::mutex*, void*> SearchInnerNode::getSlotLockAndChild(int idx) {
-    // For lock access, we need to hold structural lock to ensure stability
-    std::lock_guard<std::mutex> guard(structural_lock_);
+    std::unique_lock<HyperSlotMutex> guard(structural_lock_, std::defer_lock);
+    if (isHyperLockingEnabled()) {
+        guard.lock();
+    }
 
     if (idx < 0 || idx >= static_cast<int>(children_.size())) {
         return {nullptr, nullptr};
     }
 
-    // Return both lock pointer and child pointer atomically
     return {children_[idx].lock.get(), children_[idx].childPtr};
 }
 

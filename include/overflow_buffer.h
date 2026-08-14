@@ -5,113 +5,60 @@
 #include <vector>
 #include <optional>
 #include <algorithm>
+#include <cstring>
 
 /**
  * @class OverflowBuffer
- * @brief Stores key-value pairs in a sorted order to handle collisions
+ * @brief Dense sorted KV overflow with a flat array (no std::vector on hot path).
  *
- * OverflowBuffer is used when multiple keys map to the same slot in a leaf node.
- * It maintains a sorted vector of key-value pairs for efficient search.
+ * Paper Corollary 3.1: conflicts at a slot are bounded by 2δ+1 (δ=128 → 257).
+ * Storage is a single contiguous allocation grown up to that cap.
  */
 class OverflowBuffer {
 public:
-    /**
-     * @brief Constructs an overflow buffer with a specific capacity
-     * @param capacity Initial capacity of the buffer
-     */
+    using Pair = std::pair<KeyType, ValueType>;
+
+    /// Hard cap = 2δ+1 with paper δ=128.
+    static constexpr size_t kMaxCapacity = 257;
+    /// Default initial allocation for collision of two keys.
+    static constexpr size_t kDefaultCapacity = 8;
+
     explicit OverflowBuffer(size_t capacity);
-
-    /**
-     * @brief Default constructor
-     */
     OverflowBuffer();
-
-    /**
-     * @brief Copy constructor for RCU
-     */
     OverflowBuffer(const OverflowBuffer& other);
-
-    /**
-     * @brief Destructor
-     */
+    OverflowBuffer& operator=(const OverflowBuffer&) = delete;
     ~OverflowBuffer();
 
-    /**
-     * @brief Inserts a key-value pair into the buffer
-     * @param key Key to insert
-     * @param value Value to insert
-     */
     void insert(KeyType key, ValueType value);
-
-    /**
-     * @brief Inserts a key-value pair into the buffer (creates new copy for RCU)
-     * @param key Key to insert
-     * @param value Value to insert
-     * @return New OverflowBuffer with the inserted pair
-     */
     OverflowBuffer* insertRCU(KeyType key, ValueType value) const;
-
-    /**
-     * @brief Finds a value for the given key
-     * @param key Key to find
-     * @return Optional value if found, nullopt otherwise
-     */
     std::optional<ValueType> find(KeyType key) const;
-
-    /**
-     * @brief Removes a key-value pair from the buffer
-     * @param key Key to remove
-     * @return true if the key was found and removed, false otherwise
-     */
     bool erase(KeyType key);
-
-    /**
-     * @brief Removes a key-value pair from the buffer (creates new copy for RCU)
-     * @param key Key to remove
-     * @return New OverflowBuffer without the key, or nullptr if key not found
-     */
     OverflowBuffer* eraseRCU(KeyType key) const;
 
-    /**
-     * @brief Gets the number of key-value pairs in the buffer
-     * @return Number of key-value pairs
-     */
-    size_t size() const;
+    size_t size() const { return size_; }
+    size_t capacity() const { return cap_; }
+    bool empty() const { return size_ == 0; }
 
-    /**
-     * @brief Gets all key-value pairs in the buffer
-     * @return Vector of all key-value pairs
-     */
-    std::vector<std::pair<KeyType, ValueType>> get_all() const;
+    Pair* data() { return pairs_; }
+    const Pair* data() const { return pairs_; }
+    Pair* begin() { return pairs_; }
+    Pair* end() { return pairs_ + size_; }
+    const Pair* begin() const { return pairs_; }
+    const Pair* end() const { return pairs_ + size_; }
+    const Pair& front() const { return pairs_[0]; }
 
-    /**
-     * @brief Gets direct access to the internal buffer
-     * @return Reference to the internal buffer
-     */
-    const std::vector<std::pair<KeyType, ValueType>>& data() const { return buffer_; }
-
-    /**
-     * @brief Loads multiple key-value pairs into the buffer using move semantics
-     * @param data Vector of key-value pairs to load
-     */
-    void bulk_load(std::vector<std::pair<KeyType, ValueType>>&& data);
+    std::vector<Pair> get_all() const;
+    void bulk_load(std::vector<Pair>&& data);
 
 private:
-    /**
-     * @brief Finds the position for a key in the buffer
-     * @param key Key to find position for
-     * @return Iterator to the position
-     */
-    auto find_position(KeyType key);
+    Pair* lower_bound_key(KeyType key);
+    const Pair* lower_bound_key(KeyType key) const;
+    void ensure_capacity(size_t min_cap);
+    static size_t clamp_cap(size_t cap);
 
-    /**
-     * @brief Finds the position for a key in the buffer (const version)
-     * @param key Key to find position for
-     * @return Const iterator to the position
-     */
-    auto find_position(KeyType key) const;
-
-    std::vector<std::pair<KeyType, ValueType>> buffer_; ///< Sorted vector of key-value pairs
+    uint16_t size_ = 0;
+    uint16_t cap_ = 0;
+    Pair* pairs_ = nullptr;
 };
 
 #endif // HYPERCODE_OVERFLOW_BUFFER_H

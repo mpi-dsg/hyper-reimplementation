@@ -63,8 +63,9 @@ public:
 
         // Exponential search phase
         for (size_t i = 0; i < search_iter; ++i) {
-            // Calculate model range based on current slope
-            size_t mr = std::min(over_sub_factor, (size_t)ceil(best_slope * max_diff));
+            // Eq. 3: MR must be paired with the candidate slope under evaluation.
+            size_t mr = std::min(over_sub_factor, (size_t)ceil(slope * max_diff));
+            if (mr == 0) mr = 1;
 
             // Evaluate the cost of the current configuration
             auto [cost, slot_counts] = compute_cost(slope, mr);
@@ -176,30 +177,28 @@ private:
         }
 
         const size_t total_slots = slot_counts.size();
-        const size_t non_empty = total_slots - empty_slots;
-        const size_t search_model_slots = total_slots - (empty_slots + accurate_slots);
 
-        // Standard deviation of conflicts
-        double mean = (search_slots + model_slots == 0) ? 0 :
-                      conflict_sum / static_cast<double>(search_slots + model_slots);
-        double variance = 0;
+        // Eqs. 4–5 style: σ(γ) over conflicted slots, mean conflict cost, λ-empty penalty.
+        double mean = conflicts.empty() ? 0.0 :
+                      conflict_sum / static_cast<double>(conflicts.size());
+        double variance = 0.0;
         for (auto c : conflicts) {
             variance += (c - mean) * (c - mean);
         }
-        double std_dev = (conflicts.size() == 0) ? 0 :
-                         sqrt(variance / conflicts.size());
+        double sigma = conflicts.empty() ? 0.0 :
+                       sqrt(variance / static_cast<double>(conflicts.size()));
 
-        // Normalized conflict cost
-        double conflict_cost = (search_model_slots == 0) ? 0 :
-                               conflict_sum / static_cast<double>(search_model_slots);
-        double norm_conflict = conflict_cost / non_empty;
+        double conflict_cost = mean;  // average γ on conflicted (search/model) slots
+        double empty_ratio = static_cast<double>(empty_slots) /
+                             static_cast<double>(std::max<size_t>(total_slots, 1));
+        double memory_penalty = lambda_ * empty_ratio;
 
-        // Empty slots ratio
-        double empty_ratio = static_cast<double>(empty_slots) / total_slots;
+        // (void) unused counters kept for readability / future weighting.
+        (void)accurate_slots;
+        (void)search_slots;
+        (void)model_slots;
 
-        // Final cost combining all factors
-        double cost = std_dev + norm_conflict + empty_ratio;
-
+        double cost = sigma + conflict_cost + memory_penalty;
         return {cost, slot_counts};
     }
 

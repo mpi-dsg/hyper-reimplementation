@@ -2,6 +2,8 @@
 #include "../include/configuration_search.h"
 #include "../include/epoch_manager.h"
 #include <algorithm>
+#include <cmath>
+#include <limits>
 
 Hyper::~Hyper() {
     // Clean up the root node and its children using safe deletion
@@ -66,8 +68,9 @@ void Hyper::bulkLoad(const std::vector<std::pair<KeyType, ValueType>>& data) {
                     std::make_move_iterator(const_cast<std::pair<KeyType, ValueType>*>(&data[0] + data.size())));
 
     // Build leaf nodes for each partition.
-    auto lowLeaves = buildLeavesForPartition(std::move(lowData));
-    auto highLeaves = buildLeavesForPartition(std::move(highData));
+    auto lowLeaves = buildLeavesForPartition(std::move(lowData), cutValue - 1);
+    auto highLeaves = buildLeavesForPartition(std::move(highData),
+                                              std::numeric_limits<KeyType>::max());
 
     // Combine all leaf nodes into a single vector.
     std::vector<std::pair<KeyType, void*>> leaves;
@@ -79,71 +82,148 @@ void Hyper::bulkLoad(const std::vector<std::pair<KeyType, ValueType>>& data) {
                   std::make_move_iterator(highLeaves.begin()),
                   std::make_move_iterator(highLeaves.end()));
 
-    // Extract boundary keys from the leaf nodes.
-    std::vector<KeyType> boundary_keys;
-    boundary_keys.resize(leaves.size());
-    std::transform(leaves.begin(), leaves.end(), boundary_keys.begin(),
-                   [](const std::pair<KeyType, void*>& p) { return p.first; });
-
-    // Find optimal configuration for the root node.
-    ConfigurationSearch cs(boundary_keys, lambda_);
-    auto config = cs.search();
-
-    // Create the root model node with optimal parameters.
-    auto root = new ModelInnerNode(
-            config.best_slope,
-            boundary_keys.front(),
-            config.best_mr
-    );
-
-    // Insert all leaf nodes into the root.
-    root->bulkLoad(leaves, config.best_slot_counts, lambda_);
-
-    // Store the tagged root pointer.
-    root_ = tagPointer(root, NodeType::ModelInner);
+    // Algo 1 + configuration search (respects max_node_size_, rebalance).
+    root_.store(buildInnerFromChildren(leaves), std::memory_order_release);
 }
 
 
 std::optional<ValueType> Hyper::find(KeyType key) const {
-    //EpochManager::Guard guard; // Protect the entire find operation
-    
-    void* cur = root_.load(std::memory_order_acquire);
+    return findOnce(key, /*allow_retry=*/true);
+}
 
-    // Traverse the tree to find the leaf node containing the key
+std::optional<ValueType> Hyper::findOnce(KeyType key, bool allow_retry) const {
+    EPOCH_GUARD();
+
+    void* cur = root_.load(std::memory_order_acquire);
+    if (cur == nullptr) return std::nullopt;
+
     while (!isLeafNode(cur)) {
         if (isModelInnerNode(cur)) {
-            auto* modelNode = taggedCast<ModelInnerNode>(cur);
-            void* nextNode = modelNode->findChild(key);
-            __builtin_prefetch(nextNode, 0, 3);
-            cur = nextNode;
+            cur = taggedCast<ModelInnerNode>(cur)->findChild(key);
         } else if (isSearchInnerNode(cur)) {
-            auto* searchNode = taggedCast<SearchInnerNode>(cur);
-            void* nextNode = searchNode->findChild(key);
-            __builtin_prefetch(nextNode, 0, 3);
-            cur = nextNode;
+            cur = taggedCast<SearchInnerNode>(cur)->findChild(key);
         } else {
-            return std::nullopt;  // Unknown node type
+            return std::nullopt;
         }
+        if (cur == nullptr) return std::nullopt;
     }
 
-    // Search within the leaf node
-    auto* leaf = taggedCast<LeafNode>(cur);
-    auto result = leaf->find(key);
+    auto result = taggedCast<LeafNode>(cur)->find(key);
+    if (!result.has_value()) return std::nullopt;
 
-    // Special handling for sentinel values
+    // Sentinel payload: keys 0 / 2^63 are placeholders; other keys may land on a
+    // wrong leaf after SMO — retry once from the root.
     if (*result == std::numeric_limits<ValueType>::max()) {
-        if ((key == 0) | (key == (1ULL << 63))) {
-            return std::nullopt;
-        } else if (key != std::numeric_limits<KeyType>::max()) {
-            find(key);
-        }
+        if (key == 0 || key == (1ULL << 63)) return std::nullopt;
+        if (allow_retry) return findOnce(key, false);
+        return std::nullopt;
     }
     return result;
 }
 
+bool Hyper::erase(KeyType key) {
+    EPOCH_GUARD();
+
+    void* cur = root_.load(std::memory_order_acquire);
+    if (cur == nullptr) {
+        return false;
+    }
+
+    // Traverse to the responsible leaf (same shape as find).
+    while (!isLeafNode(cur)) {
+        if (isModelInnerNode(cur)) {
+            cur = taggedCast<ModelInnerNode>(cur)->findChild(key);
+        } else if (isSearchInnerNode(cur)) {
+            cur = taggedCast<SearchInnerNode>(cur)->findChild(key);
+        } else {
+            return false;
+        }
+        if (cur == nullptr) {
+            return false;
+        }
+    }
+
+    auto* leaf = taggedCast<LeafNode>(cur);
+    if (!leaf->erase(key)) {
+        return false;
+    }
+
+    // §4.4: rebuild leaf when density drops below the lower ratio.
+    leaf->maybeRebuildLowDensity(kMinLeafDensity);
+    return true;
+}
+
+bool Hyper::update(KeyType key, ValueType value) {
+    EPOCH_GUARD();
+
+    void* cur = root_.load(std::memory_order_acquire);
+    if (cur == nullptr) return false;
+
+    while (!isLeafNode(cur)) {
+        if (isModelInnerNode(cur)) {
+            cur = taggedCast<ModelInnerNode>(cur)->findChild(key);
+        } else if (isSearchInnerNode(cur)) {
+            cur = taggedCast<SearchInnerNode>(cur)->findChild(key);
+        } else {
+            return false;
+        }
+        if (cur == nullptr) return false;
+    }
+
+    return taggedCast<LeafNode>(cur)->update(key, value);
+}
+
+size_t Hyper::estimateModelNodeBytes(size_t n_keys) const {
+    if (n_keys == 0) return sizeof(ModelInnerNode);
+    size_t mr = static_cast<size_t>(std::ceil(n_keys * (1.0 + lambda_)));
+    return sizeof(ModelInnerNode) + (mr + 1) * sizeof(ModelInnerNode::Slot);
+}
+
+void* Hyper::buildInnerFromChildren(std::vector<std::pair<KeyType, void*>>& children) {
+    if (children.empty()) return nullptr;
+    if (children.size() == 1) return children.front().second;
+
+    // Algo 1: recursively compress levels until a candidate root fits max_node_size_.
+    std::vector<std::pair<KeyType, void*>> level = std::move(children);
+    while (level.size() > 1 && estimateModelNodeBytes(level.size()) > max_node_size_) {
+        // Target children per node so estimated model size stays under the cap.
+        size_t max_keys = 2;
+        while (max_keys < level.size() &&
+               estimateModelNodeBytes(max_keys + 1) <= max_node_size_) {
+            ++max_keys;
+        }
+        max_keys = std::max<size_t>(max_keys, 2);
+
+        std::vector<std::pair<KeyType, void*>> next;
+        next.reserve((level.size() + max_keys - 1) / max_keys);
+        for (size_t i = 0; i < level.size();) {
+            size_t end = std::min(i + max_keys, level.size());
+            std::vector<std::pair<KeyType, void*>> slice(
+                std::make_move_iterator(level.begin() + static_cast<long>(i)),
+                std::make_move_iterator(level.begin() + static_cast<long>(end)));
+            KeyType min_key = slice.front().first;
+            void* node = buildInnerFromChildren(slice);
+            next.emplace_back(min_key, node);
+            i = end;
+        }
+        level = std::move(next);
+    }
+
+    if (level.size() == 1) return level.front().second;
+
+    std::vector<KeyType> keys(level.size());
+    std::transform(level.begin(), level.end(), keys.begin(),
+                   [](const auto& p) { return p.first; });
+    ConfigurationSearch cs(keys, lambda_);
+    auto config = cs.search();
+    auto* root = new ModelInnerNode(config.best_slope, keys.front(), config.best_mr);
+    root->bulkLoad(level, config.best_slot_counts, lambda_);
+    return tagPointer(root, NodeType::ModelInner);
+}
+
 void Hyper::insert(KeyType key, ValueType value) {
-    EpochManager::Guard guard; // Protect the entire insert operation
-    
+    EPOCH_GUARD();
+
     // Initialize the index with a single leaf node if empty
     void* currentRoot = root_.load(std::memory_order_acquire);
     if (currentRoot == nullptr) {
@@ -207,19 +287,11 @@ void Hyper::insert(KeyType key, ValueType value) {
     for (int attempt = 0; attempt < MAX_INSERT_RETRIES; ++attempt) {
         InsertResult result = insertAttempt(key, value);
         if (result != InsertResult::RetryFromRoot) {
-            if (attempt > 0) {
-                std::cout << "Insert succeeded after " << (attempt + 1) << " attempts for key " << key << std::endl;
-            }
             return;
         }
-        
-        if (attempt >= 3) {
-            std::cout << "Insert retry " << (attempt + 1) << " for key " << key 
-                      << " (outdated node encountered)" << std::endl;
-        }
-        
-        if (attempt < MAX_INSERT_RETRIES - 1) {
-            std::this_thread::sleep_for(std::chrono::microseconds(1 << std::min(attempt, 10)));
+        // ST: no backoff sleep; MT: brief yield only.
+        if (attempt < MAX_INSERT_RETRIES - 1 && isHyperLockingEnabled()) {
+            std::this_thread::yield();
         }
     }
     
@@ -241,26 +313,30 @@ InsertResult Hyper::insertAttempt(KeyType key, ValueType value) {
 
         if (isModelInnerNode(cur)) {
             auto* modelNode = taggedCast<ModelInnerNode>(cur);
-            auto [slotLock, nextNode, slotIdx] = modelNode->findChildWithLock(key);
-            parentSlotIdx = slotIdx;
-
-            // Release lock immediately - we only need it for split operations
-            slotLock.unlock();
-
-            __builtin_prefetch(nextNode, 0, 3);
-            cur = nextNode;
+            if (!isHyperLockingEnabled()) {
+                parentSlotIdx = modelNode->getSlotIndex(key);
+                cur = modelNode->findChild(key);
+            } else {
+                auto [slotLock, nextNode, slotIdx] = modelNode->findChildWithLock(key);
+                parentSlotIdx = slotIdx;
+                if (slotLock.owns_lock()) {
+                    slotLock.unlock();
+                }
+                cur = nextNode;
+            }
+            __builtin_prefetch(cur, 0, 3);
 
         } else if (isSearchInnerNode(cur)) {
             auto* searchNode = taggedCast<SearchInnerNode>(cur);
             parentSlotIdx = searchNode->findChildIndex(key);
-
-            auto [slotMutexPtr, nextNode] = searchNode->getSlotLockAndChild(parentSlotIdx);
-
-            {
+            if (!isHyperLockingEnabled()) {
+                cur = searchNode->findChild(key);
+            } else {
+                auto [slotMutexPtr, nextNode] = searchNode->getSlotLockAndChild(parentSlotIdx);
                 std::lock_guard<std::mutex> slot_guard(*slotMutexPtr);
-                __builtin_prefetch(nextNode, 0, 3);
                 cur = nextNode;
             }
+            __builtin_prefetch(cur, 0, 3);
         } else {
             break;
         }
@@ -281,13 +357,16 @@ InsertResult Hyper::insertAttempt(KeyType key, ValueType value) {
                 // Check if we need to update root
                 if (parent == nullptr || needsRootUpdate(rootSnapshot, (*insertReturn.splitDescriptors)[0])) {
                     // We need to update the root using RCU
-                    return handleRootUpdate(rootSnapshot, *insertReturn.splitDescriptors);
+                    auto rr = handleRootUpdate(rootSnapshot, *insertReturn.splitDescriptors);
+                    if (insertReturn.smo_leaf) insertReturn.smo_leaf->endSmo();
+                    return rr;
                 } else {
-                    // Normal split, insert descriptors
-                    std::unique_lock<std::mutex> parentLock;
+                    // Normal split, insert descriptors (old leaf still readable).
+                    std::unique_lock<HyperSlotMutex> parentLock;
                     insertLeafDescriptors(*insertReturn.splitDescriptors, parentLock);
                 }
             }
+            if (insertReturn.smo_leaf) insertReturn.smo_leaf->endSmo();
             return InsertResult::Success;
             
         case InsertResult::RetryFromRoot:
@@ -298,167 +377,97 @@ InsertResult Hyper::insertAttempt(KeyType key, ValueType value) {
 }
 
 void Hyper::insertLeafDescriptors(const std::vector<std::pair<KeyType, void*>>& leafDescs,
-                                  std::unique_lock<std::mutex>& parentLock) {
-    // Track model nodes that might need rebuilding
-    std::set<std::pair<ModelInnerNode*, void*>> modelNodesWithParent;
-    std::set<std::pair<SearchInnerNode*, void*>> searchNodesWithParent;
-
-    for (const auto& leafDesc : leafDescs) {
-        void* cur = root_;
-        void* parentNode = nullptr;
-
-        // Tree traversal to find insertion point
-        while (!isLeafNode(cur)) {
-            if (isModelInnerNode(cur)) {
-                auto* mNode = taggedCast<ModelInnerNode>(cur);
-                modelNodesWithParent.insert({mNode, parentNode});
-
-                size_t slotIdx = mNode->getSlotIndex(leafDesc.first);
-
-                // If this is a duplicate slot, we can directly update
-                if (mNode->isDuplicateSlot(slotIdx)) {
-                    mNode->setChild(leafDesc.first, leafDesc.second);
-                    break;
-                } else {
-                    void* childPtr = mNode->getChildAtIndex(slotIdx);
-                    if (childPtr != nullptr && isLeafNode(childPtr)) {
-                        LeafNode* oldLeaf = taggedCast<LeafNode>(childPtr);
-                        // Check if it's the last leaf descriptor
-                        if (&leafDesc == &leafDescs.back()
-                            && oldLeaf->getMinKey() == taggedCast<LeafNode>(leafDesc.second)->getMinKey()) {
-                                mNode->updateChildWithExternalLock(leafDesc.first, leafDesc.second);
-                                // delete old leaf
-                        } else {
-                            // Create search inner node
-                            auto* newSearchNode = new SearchInnerNode();
-                            auto* oldLeaf = taggedCast<LeafNode>(childPtr);
-                            newSearchNode->addChild(oldLeaf->getMinKey(), childPtr);
-                            newSearchNode->addChild(leafDesc.first, leafDesc.second);
-                            mNode->setChild(std::min(oldLeaf->getMinKey(), leafDesc.first),
-                                            tagPointer(newSearchNode, NodeType::SearchInner));
-                        }
-                        break;
-                    } else if (childPtr != nullptr && isModelInnerNode(childPtr)) {
-                        auto* childModelNode = taggedCast<ModelInnerNode>(childPtr);
-
-                        if (leafDesc.first < childModelNode->getMinKey()) {
-                            // Special case: Need to rebuild subtree
-
-                            // Lock the slot to ensure consistent reads during collectAllData
-                            std::mutex& slotLock = mNode->getSlotLock(slotIdx);
-                            std::lock_guard<std::mutex> slotGuard(slotLock);
-
-                            std::vector<std::pair<KeyType, ValueType>> childData;
-                            collectAllData(leafDesc.second, childData);
-                            collectAllData(childPtr, childData);
-
-                            // Build new leaves from combined data
-                            std::vector<std::pair<KeyType, void*>> newLeaves = buildLeaves(std::move(childData));
-
-                            // Extract boundary keys for configuration search
-                            std::vector<KeyType> boundaryKeys;
-                            boundaryKeys.resize(newLeaves.size());
-                            std::transform(newLeaves.begin(), newLeaves.end(), boundaryKeys.begin(),
-                                           [](const std::pair<KeyType, void*>& p) {return p.first;});
-
-                            // Find optimal configuration
-                            ConfigurationSearch cs(boundaryKeys, lambda_);
-                            auto config = cs.search();
-
-                            // Create new model node
-                            auto* newModelNode = new ModelInnerNode(
-                                    config.best_slope,
-                                    boundaryKeys.front(),
-                                    config.best_mr
-                            );
-
-                            // Insert all leaves into the new model
-                            newModelNode->bulkLoad(newLeaves, config.best_slot_counts, lambda_);
-                            void* taggedNewModel = tagPointer(newModelNode, NodeType::ModelInner);
-
-                            // Update parent to point to the new model
-                            mNode->updateChildWithExternalLock(boundaryKeys.front(), taggedNewModel);
-
-                            // Clean up old model node
-
-                            break;
-                        }
-                    }
-                }
-
-                // Continue traversal
-                mNode->increaseLeafNodeCount();
-                parentNode = tagPointer(mNode, NodeType::ModelInner);
-                cur = mNode->getChildAtIndex(slotIdx);
-            } else if (isSearchInnerNode(cur)) {
-                auto* sNode = taggedCast<SearchInnerNode>(cur);
-                void* candidate = sNode->findChild(leafDesc.first);
-
-                // Handle search inner node cases
-                if (candidate == nullptr) {
-                    // No child found - direct insertion
-                    sNode->addChild(leafDesc.first, leafDesc.second);
-
-                    // Update parent pointers
-                    if (parentNode && isModelInnerNode(parentNode)) {
-                        taggedCast<ModelInnerNode>(parentNode)->setChild(leafDesc.first, tagPointer(sNode, NodeType::SearchInner));
-                    } else if (parentNode && isSearchInnerNode(parentNode)) {
-                        taggedCast<SearchInnerNode>(parentNode)->addChild(leafDesc.first, tagPointer(sNode, NodeType::SearchInner));
-                    }
-
-                    // Convert to model node if needed
-                    if (sNode->getChildCount() > 8) {
-                        searchNodesWithParent.insert({sNode, parentNode});
-                    }
-                    break;
-                } else if (!isLeafNode(candidate)) {
-                    // Continue traversal
-                    parentNode = tagPointer(sNode, NodeType::SearchInner);
-                    cur = candidate;
-                    continue;
-                } else {
-                    // Found a leaf, add new child
-                    sNode->addChild(leafDesc.first, leafDesc.second);
-
-                    // Convert to model if needed
-                    if (sNode->getChildCount() > 8) {
-                        searchNodesWithParent.insert({sNode, parentNode});
-                    }
-                    break;
-                }
-            }
-        }
+                                  std::unique_lock<HyperSlotMutex>& parentLock) {
+    if (leafDescs.empty()) {
+        if (parentLock.owns_lock()) parentLock.unlock();
+        return;
     }
 
-    // Release the parent lock before doing conversions and rebuilds
-    // This ensures no locks are held during collectAllData calls
-    if (parentLock.owns_lock()) {
-        parentLock.unlock();
-    }
+    // Ascending key order (performSplit returns reversed descriptors).
+    std::vector<std::pair<KeyType, void*>> descs = leafDescs;
+    std::sort(descs.begin(), descs.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
 
-    for (const auto& [searchNode, parent] : searchNodesWithParent) {
-        convertSearchNodeToModelNode(searchNode, parent);
-    }
-
-    // Check if any model nodes should be rebuilt
-    for (const auto& [modelNode, parent] : modelNodesWithParent) {
-        if (modelNode->shouldRebuild()) {
-            rebuildModelNode(modelNode, parent);
+    // Find the pre-split leaf still linked under the parent.
+    void* cur = root_.load(std::memory_order_acquire);
+    void* parentNode = nullptr;
+    while (cur && !isLeafNode(cur)) {
+        parentNode = cur;
+        if (isModelInnerNode(cur)) {
+            cur = taggedCast<ModelInnerNode>(cur)->findChild(descs.front().first);
+        } else if (isSearchInnerNode(cur)) {
+            cur = taggedCast<SearchInnerNode>(cur)->findChild(descs.front().first);
+        } else {
             break;
         }
     }
+    if (!cur || !isLeafNode(cur) || !parentNode) {
+        if (parentLock.owns_lock()) parentLock.unlock();
+        return;
+    }
 
+    void* replacement = nullptr;
+    if (descs.size() == 1) {
+        replacement = descs[0].second;
+    } else {
+        auto* sNode = new SearchInnerNode();
+        for (const auto& d : descs) {
+            sNode->addChild(d.first, d.second);
+        }
+        replacement = tagPointer(sNode, NodeType::SearchInner);
+    }
 
+    void* taggedOld = cur;
+    if (isModelInnerNode(parentNode)) {
+        auto* mNode = taggedCast<ModelInnerNode>(parentNode);
+        KeyType boundary = descs.front().first;
+        for (size_t i = 0; i < mNode->getNumSlots(); ++i) {
+            if (!mNode->getSlots()[i].isRealChild()) continue;
+            if (mNode->getSlots()[i].KeyChildPtr.second == taggedOld) {
+                boundary = mNode->getSlots()[i].KeyChildPtr.first;
+                break;
+            }
+        }
+        mNode->setChild(boundary, replacement);
+    } else if (isSearchInnerNode(parentNode)) {
+        taggedCast<SearchInnerNode>(parentNode)->replaceChildPtr(
+            taggedOld, descs.front().first, replacement);
+    }
+
+    // Old leaf is unlinked; safe to delete in ST (no concurrent readers).
+    if (!isHyperLockingEnabled()) {
+        delete taggedCast<LeafNode>(taggedOld);
+    } else {
+        safeDelete(taggedCast<LeafNode>(taggedOld));
+    }
+
+    if (parentLock.owns_lock()) parentLock.unlock();
+
+    // Optional: convert fat S-inner to M-inner.
+    if (isSearchInnerNode(replacement) &&
+        taggedCast<SearchInnerNode>(replacement)->getChildCount() > 8) {
+        convertSearchNodeToModelNode(taggedCast<SearchInnerNode>(replacement), parentNode);
+    }
 }
 
 
+std::vector<std::pair<KeyType, ValueType>> Hyper::scan(KeyType start, size_t limit) const {
+    // Count-bounded forward scan from start (paper §4.1-style leaf walk).
+    return rangeQuery(start, std::numeric_limits<KeyType>::max(), limit);
+}
+
 std::vector<std::pair<KeyType, ValueType>> Hyper::rangeQuery(KeyType left, KeyType right) const {
-    EpochManager::Guard guard; // Protect the entire range query operation
+    return rangeQuery(left, right, std::numeric_limits<size_t>::max());
+}
+
+std::vector<std::pair<KeyType, ValueType>> Hyper::rangeQuery(KeyType left, KeyType right,
+                                                             size_t limit) const {
+    EPOCH_GUARD();
     
     std::vector<std::pair<KeyType, ValueType>> result;
 
     // Early exit for invalid range or empty index
-    if (left > right || root_ == nullptr) {
+    if (limit == 0 || left > right || root_ == nullptr) {
         return result;
     }
 
@@ -506,46 +515,49 @@ std::vector<std::pair<KeyType, ValueType>> Hyper::rangeQuery(KeyType left, KeyTy
             isFirstLeaf = false;
         }
 
-        // Only scan from the computed start position
+        // Collect matches from this leaf, then sort so overflow buffers do not
+        // break key order within the leaf (scan locality).
+        std::vector<std::pair<KeyType, ValueType>> leaf_hits;
+        bool past_right = false;
         for (size_t i = startSlot; i < leaf->getSlots().size(); i++) {
             const auto& slot = leaf->getSlots()[i];
 
-            // Process single key-value pair
             if (slot.isKV()) {
-                KeyType key = leaf->decodeKey(slot.data.kv.key);
+                KeyType key = leaf->decodeKey(slot.key);
                 if (key >= left && key <= right) {
-                    result.emplace_back(key, slot.data.kv.value);
+                    leaf_hits.emplace_back(key, slot.value);
                 }
                 if (key > right) {
-                    rightBoundaryHit = true;
+                    past_right = true;
                     break;
                 }
-            }
-                // Process overflow buffer
-            else if (slot.isPointer() && slot.data.overflowPtr) {
-                const auto& buffer_data = slot.data.overflowPtr.load(std::memory_order_acquire)->data();
-
-                // Binary search for the lower bound in the overflow buffer
-                auto startIter = buffer_data.begin();
-                if (isFirstLeaf) {
-                    startIter = std::lower_bound(buffer_data.begin(), buffer_data.end(), left,
-                                                 [](const auto& pair, const KeyType key) {
-                                                     return pair.first < key;
-                                                 });
-                }
-
-                for (auto it = startIter; it != buffer_data.end(); ++it) {
+            } else if (slot.isPointer() && slot.overflowPtr) {
+                OverflowBuffer* buf = slot.overflowPtr;
+                if (!buf) continue;
+                auto startIter = std::lower_bound(
+                    buf->begin(), buf->end(), left,
+                    [](const auto& pair, const KeyType key) { return pair.first < key; });
+                for (auto it = startIter; it != buf->end(); ++it) {
                     if (it->first <= right) {
-                        result.push_back(*it);
+                        leaf_hits.push_back(*it);
                     } else {
-                        rightBoundaryHit = true;
+                        past_right = true;
                         break;
                     }
                 }
-
-                if (rightBoundaryHit) break;
+                if (past_right) break;
             }
         }
+        std::sort(leaf_hits.begin(), leaf_hits.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& kv : leaf_hits) {
+            result.push_back(kv);
+            if (result.size() >= limit) {
+                rightBoundaryHit = true;
+                break;
+            }
+        }
+        if (past_right) rightBoundaryHit = true;
 
         if (rightBoundaryHit) break;
 
@@ -667,7 +679,8 @@ std::vector<Hyper::PLASegment> Hyper::buildPlaSegments(
 }
 
 std::vector<std::pair<KeyType, void*>> Hyper::buildLeavesForPartition(
-        const std::vector<std::pair<KeyType, ValueType>>&& data) {
+        const std::vector<std::pair<KeyType, ValueType>>&& data,
+        KeyType partition_max_key) {
     // Generate PLA segments for the data
     const std::vector<PLASegment> segments = buildPlaSegments(data);
 
@@ -675,9 +688,18 @@ std::vector<std::pair<KeyType, void*>> Hyper::buildLeavesForPartition(
     std::vector<std::pair<KeyType, void*>> keyLeafPtrs;
     keyLeafPtrs.reserve(segments.size());
 
-    for (const auto& seg : segments) {
+    for (size_t i = 0; i < segments.size(); ++i) {
+        const auto& seg = segments[i];
         // Create a leaf node for this segment
         auto* leaf = new LeafNode(seg.slope, seg.min_key, data[seg.end_idx].first);
+        if (i + 1 < segments.size()) {
+            leaf->setMaxPossibleKey(segments[i + 1].min_key - 1);
+        } else {
+            // Cap last leaf to the partition bound (low half ends at 2^63-1).
+            // Default KeyType::max would let a high key enter a low leaf and
+            // corrupt MSB tagging in decodeKey.
+            leaf->setMaxPossibleKey(partition_max_key);
+        }
 
         // Extract data for this segment
         std::vector<std::pair<KeyType, ValueType>> segData(
@@ -716,8 +738,9 @@ std::vector<std::pair<KeyType, void*>> Hyper::buildLeaves(
         std::vector<std::pair<KeyType, ValueType>> highData(partitionIt, data.end());
 
         // Build leaves for each partition
-        auto leavesLow = buildLeavesForPartition(std::move(lowData));
-        auto leavesHigh = buildLeavesForPartition(std::move(highData));
+        auto leavesLow = buildLeavesForPartition(std::move(lowData), cutValue - 1);
+        auto leavesHigh = buildLeavesForPartition(std::move(highData),
+                                                  std::numeric_limits<KeyType>::max());
 
         // Combine the results
         leavesLow.insert(leavesLow.end(),
@@ -726,122 +749,73 @@ std::vector<std::pair<KeyType, void*>> Hyper::buildLeaves(
         return leavesLow;
     } else {
         // No need to split, process as a single partition
-        return buildLeavesForPartition(std::move(const_cast<std::vector<std::pair<KeyType, ValueType>>&>(data)));
+        KeyType pmax = hasHigh ? std::numeric_limits<KeyType>::max() : (cutValue - 1);
+        return buildLeavesForPartition(
+            std::move(const_cast<std::vector<std::pair<KeyType, ValueType>>&>(data)), pmax);
     }
 }
 
 void Hyper::rebuildModelNode(ModelInnerNode* modelNode, void* parentNode) {
-    std::unique_lock<std::mutex> parentLock;
+    // Paper §3.3.2: rebuild the M-inner from child leftmost keys — do not
+    // rewrite leaves via collectAllData + PLA.
+    auto children = modelNode->collectSortedChildren();
+    if (children.empty()) return;
+    KeyType boundary = children.front().first;
+    void* taggedNew = buildInnerFromChildren(children);
+
+    auto abandonNewInner = [&](void* node) {
+        // Newly allocated inner points at the same children as the old node.
+        if (isModelInnerNode(node)) {
+            taggedCast<ModelInnerNode>(node)->disownChildren();
+            delete taggedCast<ModelInnerNode>(node);
+        } else if (isSearchInnerNode(node)) {
+            taggedCast<SearchInnerNode>(node)->disownChildren();
+            delete taggedCast<SearchInnerNode>(node);
+        }
+        // If buildInner returned an existing leaf (single child), leave it alone.
+    };
+
+    std::unique_lock<HyperSlotMutex> parentLock;
 
     if (parentNode == nullptr) {
-        // This is the root node - use RCU update instead of locking
         void* oldRoot = tagPointer(modelNode, NodeType::ModelInner);
-        
-        // Collect all data from the model node subtree
-        std::vector<std::pair<KeyType, ValueType>> allData;
-        collectAllData(oldRoot, allData);
-
-        // Build new leaves from collected data
-        std::vector<std::pair<KeyType, void*>> newLeaves = buildLeaves(std::move(allData));
-
-        // Extract boundary keys for configuration search
-        std::vector<KeyType> newBoundaryKeys;
-        newBoundaryKeys.resize(newLeaves.size());
-        std::transform(newLeaves.begin(), newLeaves.end(), newBoundaryKeys.begin(),
-                       [](const std::pair<KeyType, void*>& p) { return p.first; });
-
-        // Find optimal configuration
-        ConfigurationSearch cs(newBoundaryKeys, lambda_);
-        auto config = cs.search();
-
-        // Create new model node with optimal parameters
-        auto* newModelNode = new ModelInnerNode(
-                config.best_slope,
-                newBoundaryKeys.front(),
-                config.best_mr
-        );
-
-        // Insert all leaves into the new model
-        newModelNode->bulkLoad(newLeaves, config.best_slot_counts, lambda_);
-        void* taggedNewModelNode = tagPointer(newModelNode, NodeType::ModelInner);
-
-        // Try RCU update
-        if (!updateRootRCU(oldRoot, taggedNewModelNode)) {
-            // Root changed during rebuild, clean up and let caller retry
-            safeDelete(newModelNode);
+        if (!updateRootRCU(oldRoot, taggedNew)) {
+            abandonNewInner(taggedNew);
             return;
         }
-        
-        // Successfully updated root via RCU
+        modelNode->disownChildren();
+        safeDelete(modelNode);
         return;
-        
-    } else if (isModelInnerNode(parentNode)) {
-        // Parent is a model inner node - find and lock the appropriate slot
-        auto* modelParent = taggedCast<ModelInnerNode>(parentNode);
+    }
 
-        // Find which slot contains this model node
+    if (isModelInnerNode(parentNode)) {
+        auto* modelParent = taggedCast<ModelInnerNode>(parentNode);
         size_t slotIdx = 0;
         bool found = false;
         void* taggedModelNode = tagPointer(modelNode, NodeType::ModelInner);
-
         for (size_t i = 0; i < modelParent->getNumSlots(); i++) {
-            void* child = modelParent->getChildAtIndex(i);
-            if (child == taggedModelNode) {
+            if (modelParent->getChildAtIndex(i) == taggedModelNode) {
                 slotIdx = i;
                 found = true;
                 break;
             }
         }
-
-        if (found) {
-            parentLock = std::unique_lock<std::mutex>(modelParent->getSlotLock(slotIdx));
+        if (found && isHyperLockingEnabled()) {
+            parentLock = std::unique_lock<HyperSlotMutex>(modelParent->getSlotLock(slotIdx));
         }
+        modelParent->updateChildWithExternalLock(boundary, taggedNew);
     } else if (isSearchInnerNode(parentNode)) {
-        // Parent is a search inner node - lock structural lock
         auto* searchParent = taggedCast<SearchInnerNode>(parentNode);
-        parentLock = std::unique_lock<std::mutex>(searchParent->structural_lock_);
+        if (isHyperLockingEnabled()) {
+            parentLock = std::unique_lock<HyperSlotMutex>(searchParent->structural_lock_);
+        }
+        searchParent->addChild(boundary, taggedNew);
+    } else {
+        abandonNewInner(taggedNew);
+        return;
     }
 
-    // Collect all data from the model node subtree
-    std::vector<std::pair<KeyType, ValueType>> allData;
-    collectAllData(tagPointer(modelNode, NodeType::ModelInner), allData);
-
-    // Build new leaves from collected data
-    std::vector<std::pair<KeyType, void*>> newLeaves = buildLeaves(std::move(allData));
-
-    // Extract boundary keys for configuration search
-    std::vector<KeyType> newBoundaryKeys;
-    newBoundaryKeys.resize(newLeaves.size());
-    std::transform(newLeaves.begin(), newLeaves.end(), newBoundaryKeys.begin(),
-                   [](const std::pair<KeyType, void*>& p) { return p.first; });
-
-    // Find optimal configuration
-    ConfigurationSearch cs(newBoundaryKeys, lambda_);
-    auto config = cs.search();
-
-    // Create new model node with optimal parameters
-    auto* newModelNode = new ModelInnerNode(
-            config.best_slope,
-            newBoundaryKeys.front(),
-            config.best_mr
-    );
-
-    // Insert all leaves into the new model
-    newModelNode->bulkLoad(newLeaves, config.best_slot_counts, lambda_);
-    void* taggedNewModelNode = tagPointer(newModelNode, NodeType::ModelInner);
-
-    // Update parent based on parent type (non-root cases)
-    if (isModelInnerNode(parentNode)) {
-        // Parent is a model inner node - use updateChildWithExternalLock
-        auto* modelParent = taggedCast<ModelInnerNode>(parentNode);
-        modelParent->updateChildWithExternalLock(newBoundaryKeys.front(), taggedNewModelNode);
-    } else if (isSearchInnerNode(parentNode)) {
-        // Parent is a search inner node - replace the child
-        auto* searchParent = taggedCast<SearchInnerNode>(parentNode);
-        searchParent->addChild(newBoundaryKeys.front(), taggedNewModelNode);
-    }
-
-    // Clean up old model node using safe deletion
+    modelNode->disownChildren();
     safeDelete(modelNode);
 }
 
@@ -861,7 +835,7 @@ void Hyper::collectAllData(void* node, std::vector<std::pair<KeyType, ValueType>
         std::set<void*> processedChildren;  // Avoid duplicates
 
         for (size_t i = 0; i < numSlots; i++) {
-            std::mutex& slotLock = modelNode->getSlotLock(i);
+            HyperSlotMutex& slotLock = modelNode->getSlotLock(i);
 
             if (slotLock.try_lock()) {
                 // Got the lock - can read safely
@@ -914,67 +888,75 @@ void Hyper::collectAllData(void* node, std::vector<std::pair<KeyType, ValueType>
 }
 
 void Hyper::convertSearchNodeToModelNode(SearchInnerNode* sNode, void* parentNode) {
-    std::unique_lock<std::mutex> parentLock;
-    KeyType searchNodeKey = 0; // Will store the key for this search node in parent
+    // Paper §3.3.2: S-inner → M-inner from existing children (same as M-inner
+    // rebuild — do not rewrite leaves via collectAllData + PLA). Rebuilding
+    // leaves here duplicated every KV and ballooned OSM memory ~2×.
+    // Parent may be null / ModelInner / SearchInner — never assume ModelInner.
+    auto children = sNode->getChildren();
+    if (children.size() <= 1) return;
+    KeyType boundary = children.front().first;
+    void* taggedNew = buildInnerFromChildren(children);
 
-    // Parent is a model inner node - find and lock the appropriate slot
-    auto* modelParent = taggedCast<ModelInnerNode>(parentNode);
+    auto abandonNewInner = [&](void* node) {
+        // Newly allocated inner points at the same children as the S-inner.
+        if (isModelInnerNode(node)) {
+            taggedCast<ModelInnerNode>(node)->disownChildren();
+            delete taggedCast<ModelInnerNode>(node);
+        } else if (isSearchInnerNode(node)) {
+            taggedCast<SearchInnerNode>(node)->disownChildren();
+            delete taggedCast<SearchInnerNode>(node);
+        }
+    };
 
-    // Find which slot contains this search node
-    size_t slotIdx = 0;
+    std::unique_lock<HyperSlotMutex> parentLock;
     void* taggedSearchNode = tagPointer(sNode, NodeType::SearchInner);
 
-    for (size_t i = 0; i < modelParent->getNumSlots(); i++) {
-        void* child = modelParent->getChildAtIndex(i);
-        if (child == taggedSearchNode) {
-            slotIdx = i;
-            break;
+    if (parentNode == nullptr) {
+        if (!updateRootRCU(taggedSearchNode, taggedNew)) {
+            abandonNewInner(taggedNew);
+            return;
         }
+        sNode->disownChildren();
+        safeDelete(sNode);
+        return;
     }
 
-    // Lock the specific slot
-    parentLock = std::unique_lock<std::mutex>(modelParent->getSlotLock(slotIdx));
-
-    // Get the key for this search node (needed for updating parent)
-    const auto& slot = modelParent->getSlots()[slotIdx];
-    if (slot.isRealChild()) {
-        searchNodeKey = slot.KeyChildPtr.first;
+    if (isModelInnerNode(parentNode)) {
+        auto* modelParent = taggedCast<ModelInnerNode>(parentNode);
+        size_t slotIdx = 0;
+        bool found = false;
+        // Prefer the real slot that owns this S-inner (skip duplicate aliases).
+        for (size_t i = 0; i < modelParent->getNumSlots(); i++) {
+            if (!modelParent->getSlots()[i].isRealChild()) continue;
+            if (modelParent->getChildAtIndex(i) == taggedSearchNode) {
+                slotIdx = i;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            abandonNewInner(taggedNew);
+            return;
+        }
+        if (isHyperLockingEnabled()) {
+            parentLock = std::unique_lock<HyperSlotMutex>(modelParent->getSlotLock(slotIdx));
+        }
+        boundary = modelParent->getSlots()[slotIdx].KeyChildPtr.first;
+        modelParent->updateChildWithExternalLock(boundary, taggedNew);
+    } else if (isSearchInnerNode(parentNode)) {
+        auto* searchParent = taggedCast<SearchInnerNode>(parentNode);
+        if (isHyperLockingEnabled()) {
+            parentLock = std::unique_lock<HyperSlotMutex>(searchParent->structural_lock_);
+        }
+        // Replace by pointer so a boundary-key mismatch cannot leave the old
+        // S-inner dangling beside the new M-inner.
+        searchParent->replaceChildPtr(taggedSearchNode, boundary, taggedNew);
+    } else {
+        abandonNewInner(taggedNew);
+        return;
     }
 
-    // Collect all data
-    std::vector<std::pair<KeyType, ValueType>> subtreeData;
-
-   collectAllData(sNode, subtreeData);
-
-    // Build new leaves from leaf data
-    std::vector<std::pair<KeyType, void*>> newLeaves;
-    newLeaves = buildLeaves(std::move(subtreeData));
-
-    // Extract boundary keys for configuration search
-    std::vector<KeyType> newBoundaryKeys;
-    newBoundaryKeys.resize(newLeaves.size());
-    std::transform(newLeaves.begin(), newLeaves.end(), newBoundaryKeys.begin(),
-                   [](const std::pair<KeyType, void*>& p) { return p.first; });
-
-    // Find optimal configuration
-    ConfigurationSearch cs(newBoundaryKeys, lambda_);
-    auto config = cs.search();
-
-    // Create new model node with optimal parameters
-    auto* newModelNode = new ModelInnerNode(
-            config.best_slope,
-            newBoundaryKeys.front(),
-            config.best_mr
-    );
-
-    // Insert all leaves into the new model
-    newModelNode->bulkLoad(newLeaves, config.best_slot_counts, lambda_);
-    void* taggedNewModelNode = tagPointer(newModelNode, NodeType::ModelInner);
-
-    // Update parent using updateChildWithExternalLock since we hold the slot lock
-    modelParent->updateChildWithExternalLock(newBoundaryKeys.front(), taggedNewModelNode);
-
-    // Clean up old search node using safe deletion
+    sNode->disownChildren();
     safeDelete(sNode);
 }
 
@@ -1052,22 +1034,66 @@ InsertResult Hyper::handleRootUpdate(void* oldRoot, const std::vector<std::pair<
         searchRoot->bulk_load(allChildren);
         newRoot = tagPointer(searchRoot, NodeType::SearchInner);
     } else {
-        // Use model inner node with configuration search
-        std::vector<KeyType> keys;
-        keys.reserve(allChildren.size());
-        std::transform(allChildren.begin(), allChildren.end(), std::back_inserter(keys),
-                      [](const auto& p) { return p.first; });
-        
-        ConfigurationSearch cs(keys, lambda_);
-        auto config = cs.search();
-        
-        auto* modelRoot = new ModelInnerNode(config.best_slope, keys.front(), config.best_mr);
-        modelRoot->bulkLoad(allChildren, config.best_slot_counts, lambda_);
-        newRoot = tagPointer(modelRoot, NodeType::ModelInner);
+        newRoot = buildInnerFromChildren(allChildren);
     }
     
     // Atomically update root
     root_.store(newRoot, std::memory_order_release);
     
     return InsertResult::Success;
+}
+
+void Hyper::accumulateMemory(void* node, MemoryStats& stats,
+                             std::set<void*>& visited_nodes) const {
+    if (node == nullptr) return;
+
+    // Dedup on untagged address so duplicate slots and tag bits cannot
+    // re-enter the same physical node (avoids cycles / double-count).
+    void* identity = untagPointer(node);
+    if (!visited_nodes.insert(identity).second) return;
+
+    if (isLeafNode(node)) {
+        stats.leaf_bytes += taggedCast<LeafNode>(node)->memoryBytes();
+        return;
+    }
+
+    if (isModelInnerNode(node)) {
+        auto* model = taggedCast<ModelInnerNode>(node);
+        stats.index_bytes += sizeof(ModelInnerNode);
+        stats.index_bytes += model->getNumSlots() * sizeof(ModelInnerNode::Slot);
+        for (const auto& slot : model->getSlots()) {
+            void* child = nullptr;
+            if (slot.isRealChild()) {
+                child = slot.KeyChildPtr.second;
+            } else {
+                child = slot.getChildPtr();
+            }
+            if (child == nullptr) continue;
+            accumulateMemory(child, stats, visited_nodes);
+        }
+        return;
+    }
+
+    if (isSearchInnerNode(node)) {
+        auto* search = taggedCast<SearchInnerNode>(node);
+        auto children = search->getChildren();
+        stats.index_bytes += sizeof(SearchInnerNode);
+        // ChildEntry vector: key + pointer (+ lock heap object approximated)
+        stats.index_bytes += children.size() *
+                             (sizeof(KeyType) + sizeof(void*) + sizeof(std::mutex));
+        for (const auto& [key, child] : children) {
+            (void)key;
+            if (child == nullptr) continue;
+            accumulateMemory(child, stats, visited_nodes);
+        }
+    }
+}
+
+Hyper::MemoryStats Hyper::memoryStats() const {
+    MemoryStats stats;
+    void* root = root_.load(std::memory_order_acquire);
+    if (root == nullptr) return stats;
+    std::set<void*> visited;
+    accumulateMemory(root, stats, visited);
+    return stats;
 }

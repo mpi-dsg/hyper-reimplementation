@@ -1,9 +1,17 @@
 #include "../include/model_inner_node.h"
+#include <algorithm>
+#include <set>
+#include <thread>
 #include "../include/epoch_manager.h"
 
 // --- ModelInnerNode implementation ---
 ModelInnerNode::ModelInnerNode(double slope, KeyType minKey, size_t MR)
         : slope_(slope), minKey_(minKey), MR_(MR), slots_(MR + 1) {
+    if (isHyperLockingEnabled()) {
+        slot_locks_ = std::make_unique<HyperSlotMutex[]>(MR + 1);
+        slot_versions_ = std::make_unique<std::atomic<uint64_t>[]>(MR + 1);
+        for (size_t i = 0; i <= MR; ++i) slot_versions_[i].store(0, std::memory_order_relaxed);
+    }
 }
 
 ModelInnerNode::~ModelInnerNode() {
@@ -16,30 +24,37 @@ ModelInnerNode::~ModelInnerNode() {
 }
 
 bool ModelInnerNode::readSlotSeqLock(size_t idx, KeyType& key, void*& child, bool& isReal) const {
-    uint64_t version_before, version_after;
-
-    do {
-        // Read version before accessing data
-        version_before = slots_[idx].version.load(std::memory_order_acquire);
-
-        // If version is odd, a writer is active - retry
-        if (version_before & 1) {
-            continue;
-        }
-
-        // Read slot data
+    // ST unlocked path: plain read (no seqlock atomics).
+    if (!isHyperLockingEnabled()) {
         isReal = slots_[idx].isRealChild();
         if (isReal) {
             key = slots_[idx].KeyChildPtr.first;
             child = slots_[idx].KeyChildPtr.second;
         } else {
-            // For duplicate slots, we have the direct child pointer
-            key = 0; // Not used for duplicates
+            key = 0;
+            child = slots_[idx].getChildPtr();
+        }
+        return true;
+    }
+
+    uint64_t version_before, version_after;
+
+    do {
+        version_before = slot_versions_[idx].load(std::memory_order_acquire);
+        if (version_before & 1) {
+            continue;
+        }
+
+        isReal = slots_[idx].isRealChild();
+        if (isReal) {
+            key = slots_[idx].KeyChildPtr.first;
+            child = slots_[idx].KeyChildPtr.second;
+        } else {
+            key = 0;
             child = slots_[idx].getChildPtr();
         }
 
-        // Read version after accessing data
-        version_after = slots_[idx].version.load(std::memory_order_acquire);
+        version_after = slot_versions_[idx].load(std::memory_order_acquire);
 
     } while (version_before != version_after || (version_before & 1));
 
@@ -50,7 +65,7 @@ void ModelInnerNode::updateSlotSeqLock(size_t idx, KeyType key, void* child, boo
     // Caller must already hold Lock
 
     // Begin write operation (increment to odd number)
-    slots_[idx].beginWrite();
+    beginWrite(idx);
 
     // Update slot data
     if (makeReal) {
@@ -69,85 +84,123 @@ void ModelInnerNode::updateSlotSeqLock(size_t idx, KeyType key, void* child, boo
     }
 
     // End write operation (increment to even number)
-    slots_[idx].endWrite();
+    endWrite(idx);
 }
 
 void ModelInnerNode::updateSlotDuplicateSeqLock(size_t idx, void* childPtr) {
     // Caller must already hold Lock
 
     // Begin write operation (increment to odd number)
-    slots_[idx].beginWrite();
+    beginWrite(idx);
 
     // Update slot as duplicate with direct child pointer
     slots_[idx].setDuplicate(childPtr);
 
     // End write operation (increment to even number)
-    slots_[idx].endWrite();
+    endWrite(idx);
 }
 
 void* ModelInnerNode::findChild(KeyType key) const {
-    // Predict slot position for the key
+    // Paper Fig. 6: predict; if real slot key > query, take left neighbor.
+    // Duplicates store predecessor child so empties to the right need no walk.
     size_t idx = predictSlot(key);
 
     KeyType slotKey;
     void* slotChild;
     bool isReal;
 
-    // Read the predicted slot with seq lock
     readSlotSeqLock(idx, slotKey, slotChild, isReal);
 
-    if (isReal) {
-        // Check if we need to look at the previous slot
-        if (slotKey > key && idx > 0) {
-            idx--;
-            readSlotSeqLock(idx, slotKey, slotChild, isReal);
-        }
-
-        if (isReal) {
-            return slotChild;
-        } else {
-            // This is a duplicate slot, return the direct child pointer
-            return slotChild;
-        }
-    } else {
-        // This is a duplicate slot, return the direct child pointer
-        return slotChild;
+    if (isReal && slotKey > key && idx > 0) {
+        --idx;
+        readSlotSeqLock(idx, slotKey, slotChild, isReal);
     }
+
+    // Leading empty holes (before first real): step left/right to a filled slot.
+    if (slotChild == nullptr) {
+        for (size_t i = idx; i > 0;) {
+            --i;
+            readSlotSeqLock(i, slotKey, slotChild, isReal);
+            if (slotChild) return slotChild;
+        }
+        for (size_t i = idx + 1; i < slots_.size(); ++i) {
+            readSlotSeqLock(i, slotKey, slotChild, isReal);
+            if (slotChild) return slotChild;
+        }
+    }
+    return slotChild;
 }
 
 void ModelInnerNode::setChild(KeyType key, void* child) {
-    bool success = false;
+    auto apply = [&](size_t idx, const std::vector<size_t>& slots_to_lock) {
+        const bool wasReal = slots_[idx].isRealChild();
+        void* oldChild = wasReal ? slots_[idx].KeyChildPtr.second : slots_[idx].getChildPtr();
+        size_t newChildLeafCount = countLeafNodesInSubtree(child);
 
-    while (!success) {
-        // Predict the slot for this key
-        size_t idx = predictSlot(key);
+        for (auto it = slots_to_lock.rbegin(); it != slots_to_lock.rend(); ++it) {
+            beginWrite(*it);
+        }
 
-        // Collect slots that need to be locked
+        if (wasReal) {
+            size_t oldChildLeafCount = countLeafNodesInSubtree(oldChild);
+            if (newChildLeafCount > oldChildLeafCount) {
+                leaf_node_count_.fetch_add(newChildLeafCount - oldChildLeafCount, std::memory_order_relaxed);
+            } else if (oldChildLeafCount > newChildLeafCount) {
+                size_t decrease = std::min(leaf_node_count_.load(std::memory_order_relaxed),
+                                           oldChildLeafCount - newChildLeafCount);
+                leaf_node_count_.fetch_sub(decrease, std::memory_order_relaxed);
+            }
+        } else {
+            leaf_node_count_.fetch_add(newChildLeafCount, std::memory_order_relaxed);
+        }
+
+        if (!slots_[idx].isRealChild()) {
+            slots_[idx].setRealChild(key, child);
+        } else {
+            slots_[idx].KeyChildPtr.first = key;
+            slots_[idx].KeyChildPtr.second = child;
+        }
+
+        for (size_t i = 1; i < slots_to_lock.size(); i++) {
+            slots_[slots_to_lock[i]].setDuplicate(child);
+        }
+
+        for (size_t i = 0; i < slots_to_lock.size(); i++) {
+            endWrite(slots_to_lock[i]);
+        }
+    };
+
+    auto collect_slots = [&](size_t idx) {
         std::vector<size_t> slots_to_lock;
         slots_to_lock.push_back(idx);
-
-        // Find all consecutive duplicate slots to the right
         for (size_t i = idx + 1; i < slots_.size(); i++) {
             KeyType tempKey;
             void* tempChild;
             bool isReal;
             readSlotSeqLock(i, tempKey, tempChild, isReal);
-
-            if (isReal) {
-                break;
-            }
+            if (isReal) break;
             slots_to_lock.push_back(i);
         }
+        return slots_to_lock;
+    };
 
-        // Try to acquire all locks in reverse order (rightmost first) to avoid deadlock
-        std::vector<std::unique_lock<std::mutex>> locks;
+    if (!isHyperLockingEnabled()) {
+        size_t idx = predictSlot(key);
+        apply(idx, collect_slots(idx));
+        return;
+    }
+
+    bool success = false;
+    while (!success) {
+        size_t idx = predictSlot(key);
+        auto slots_to_lock = collect_slots(idx);
+
+        std::vector<std::unique_lock<HyperSlotMutex>> locks;
         locks.reserve(slots_to_lock.size());
-
         bool all_locked = true;
         for (auto it = slots_to_lock.rbegin(); it != slots_to_lock.rend(); ++it) {
-            std::unique_lock<std::mutex> lock(slots_[*it].lock, std::try_to_lock);
+            std::unique_lock<HyperSlotMutex> lock(slot_locks_[*it], std::try_to_lock);
             if (!lock.owns_lock()) {
-                // Failed to acquire lock - release all and retry
                 all_locked = false;
                 break;
             }
@@ -155,30 +208,29 @@ void ModelInnerNode::setChild(KeyType key, void* child) {
         }
 
         if (!all_locked) {
-            // Release all locks and retry from the beginning
             locks.clear();
+            std::this_thread::yield();
             continue;
         }
 
-        // All locks acquired successfully - begin seq lock write phase
-        // Increment all versions to odd numbers (in same order as locks were acquired)
-        for (auto it = slots_to_lock.rbegin(); it != slots_to_lock.rend(); ++it) {
-            slots_[*it].beginWrite();
-        }
+        apply(idx, slots_to_lock);
+        success = true;
+    }
+}
 
-        // Count leaf nodes in the new subtree
+void ModelInnerNode::updateChildWithExternalLock(KeyType key, void* child) {
+    auto apply = [&](size_t idx, const std::vector<size_t>& additional_slots_to_lock) {
+        const bool wasReal = slots_[idx].isRealChild();
+        void* oldChild = wasReal ? slots_[idx].KeyChildPtr.second : slots_[idx].getChildPtr();
         size_t newChildLeafCount = countLeafNodesInSubtree(child);
 
-        // Update the main slot
-        KeyType oldKey;
-        void* oldChild;
-        bool wasReal;
-        readSlotSeqLock(idx, oldKey, oldChild, wasReal);
+        beginWrite(idx);
+        for (auto it = additional_slots_to_lock.rbegin(); it != additional_slots_to_lock.rend(); ++it) {
+            beginWrite(*it);
+        }
 
         if (wasReal) {
-            // Slot already has content, adjust leaf count
             size_t oldChildLeafCount = countLeafNodesInSubtree(oldChild);
-
             if (newChildLeafCount > oldChildLeafCount) {
                 leaf_node_count_.fetch_add(newChildLeafCount - oldChildLeafCount, std::memory_order_relaxed);
             } else if (oldChildLeafCount > newChildLeafCount) {
@@ -187,70 +239,56 @@ void ModelInnerNode::setChild(KeyType key, void* child) {
                 leaf_node_count_.fetch_sub(decrease, std::memory_order_relaxed);
             }
         } else {
-            // New slot, add leaf count
             leaf_node_count_.fetch_add(newChildLeafCount, std::memory_order_relaxed);
         }
 
-        // Update slot data
         if (!slots_[idx].isRealChild()) {
             slots_[idx].setRealChild(key, child);
         } else {
-            // Safe deletion of old child before replacing
-            // void* oldChild = slots_[idx].KeyChildPtr.second;
-            // if (oldChild && oldChild != child) {
-            //     safeDelete(oldChild);
-            // }
             slots_[idx].KeyChildPtr.first = key;
             slots_[idx].KeyChildPtr.second = child;
         }
 
-        // Update duplicate slots with direct child pointers
-        for (size_t i = 1; i < slots_to_lock.size(); i++) {
-            slots_[slots_to_lock[i]].setDuplicate(child);
+        for (size_t slotIdx : additional_slots_to_lock) {
+            slots_[slotIdx].setDuplicate(child);
         }
 
-        // End seq lock write phase - increment versions to even numbers (reverse order)
-        for (size_t i = 0; i < slots_to_lock.size(); i++) {
-            slots_[slots_to_lock[i]].endWrite();
+        for (size_t slotIdx : additional_slots_to_lock) {
+            endWrite(slotIdx);
         }
+        endWrite(idx);
+    };
 
-        success = true;
-        // Locks are automatically released when going out of scope
-    }
-}
-
-void ModelInnerNode::updateChildWithExternalLock(KeyType key, void* child) {
-    bool success = false;
-
-    while (!success) {
-        // Predict the slot for this key
-        size_t idx = predictSlot(key);
-
-        // Collect additional slots that need to be locked (excluding main slot which should already be locked)
+    auto collect_additional = [&](size_t idx) {
         std::vector<size_t> additional_slots_to_lock;
-
-        // Find all consecutive duplicate slots to the right
         for (size_t i = idx + 1; i < slots_.size(); i++) {
             KeyType tempKey;
             void* tempChild;
             bool isReal;
             readSlotSeqLock(i, tempKey, tempChild, isReal);
-
-            if (isReal) {
-                break;
-            }
+            if (isReal) break;
             additional_slots_to_lock.push_back(i);
         }
+        return additional_slots_to_lock;
+    };
 
-        // Try to acquire additional locks in reverse order
-        std::vector<std::unique_lock<std::mutex>> additional_locks;
+    if (!isHyperLockingEnabled()) {
+        size_t idx = predictSlot(key);
+        apply(idx, collect_additional(idx));
+        return;
+    }
+
+    bool success = false;
+    while (!success) {
+        size_t idx = predictSlot(key);
+        auto additional_slots_to_lock = collect_additional(idx);
+
+        std::vector<std::unique_lock<HyperSlotMutex>> additional_locks;
         additional_locks.reserve(additional_slots_to_lock.size());
-
         bool all_additional_locked = true;
         for (auto it = additional_slots_to_lock.rbegin(); it != additional_slots_to_lock.rend(); ++it) {
-            std::unique_lock<std::mutex> lock(slots_[*it].lock, std::try_to_lock);
+            std::unique_lock<HyperSlotMutex> lock(slot_locks_[*it], std::try_to_lock);
             if (!lock.owns_lock()) {
-                // Failed to acquire lock - release all and retry
                 all_additional_locked = false;
                 break;
             }
@@ -258,69 +296,13 @@ void ModelInnerNode::updateChildWithExternalLock(KeyType key, void* child) {
         }
 
         if (!all_additional_locked) {
-            // Release all additional locks and retry from the beginning
             additional_locks.clear();
+            std::this_thread::yield();
             continue;
         }
 
-        // All locks acquired successfully - begin seq lock write phase
-        // Increment main slot version to odd number (already locked externally)
-        slots_[idx].beginWrite();
-
-        // Increment additional slot versions to odd numbers (in reverse order)
-        for (auto it = additional_slots_to_lock.rbegin(); it != additional_slots_to_lock.rend(); ++it) {
-            slots_[*it].beginWrite();
-        }
-
-        // Count leaf nodes in the new subtree
-        size_t newChildLeafCount = countLeafNodesInSubtree(child);
-
-        // Update the main slot
-        KeyType oldKey;
-        void* oldChild;
-        bool wasReal;
-        readSlotSeqLock(idx, oldKey, oldChild, wasReal);
-
-        if (wasReal) {
-            // Slot already has content, adjust leaf count
-            size_t oldChildLeafCount = countLeafNodesInSubtree(oldChild);
-
-            if (newChildLeafCount > oldChildLeafCount) {
-                leaf_node_count_.fetch_add(newChildLeafCount - oldChildLeafCount, std::memory_order_relaxed);
-            } else if (oldChildLeafCount > newChildLeafCount) {
-                size_t decrease = std::min(leaf_node_count_.load(std::memory_order_relaxed),
-                                           oldChildLeafCount - newChildLeafCount);
-                leaf_node_count_.fetch_sub(decrease, std::memory_order_relaxed);
-            }
-        } else {
-            // New slot, add leaf count
-            leaf_node_count_.fetch_add(newChildLeafCount, std::memory_order_relaxed);
-        }
-
-        // Update slot data
-        if (!slots_[idx].isRealChild()) {
-            slots_[idx].setRealChild(key, child);
-        } else {
-            slots_[idx].KeyChildPtr.first = key;
-            slots_[idx].KeyChildPtr.second = child;
-        }
-
-        // Update duplicate slots with direct child pointers
-        for (size_t slotIdx : additional_slots_to_lock) {
-            slots_[slotIdx].setDuplicate(child);
-        }
-
-        // End seq lock write phase - increment versions to even numbers (forward order)
-        for (size_t slotIdx : additional_slots_to_lock) {
-            slots_[slotIdx].endWrite();
-        }
-
-        // End main slot write phase last
-        slots_[idx].endWrite();
-
+        apply(idx, additional_slots_to_lock);
         success = true;
-        // Additional locks are automatically released when going out of scope
-        // Main slot lock remains held by caller
     }
 }
 
@@ -365,87 +347,87 @@ void ModelInnerNode::bulkSetChild(KeyType key, void* child) {
 
 void ModelInnerNode::bulkLoad(std::vector<std::pair<KeyType, void*>>& leaves,
                               std::vector<int>& slot_counts, double lambda) {
-    // Initialize active slots array
-    std::vector<int> act_slots(MR_ + 1, 0);
-
-    // Count predicted slots for all leaves
-    for (auto & leave : leaves) {
-        auto pos = predictSlot(leave.first);
-        act_slots[pos]++;
-    }
-
-    // Calculate cumulative sums for slot indices
     std::vector<int> sums(slot_counts.size());
     std::partial_sum(slot_counts.begin(), slot_counts.end(), sums.begin());
 
-    // Reset leaf node counts
     leaf_node_count_.store(0, std::memory_order_relaxed);
     initial_leaf_node_count_.store(0, std::memory_order_relaxed);
 
-    // Process each slot with its corresponding leaves
-    for (int i = 0; i < slot_counts.size(); ++i) {
-        // Skip empty slots
-        if (slot_counts[i] == 0) {
+    const size_t half = leaves.size() / 2;
+
+    auto build_group = [&](std::vector<std::pair<KeyType, void*>>& group) -> void* {
+        if (group.size() == 1) return group.front().second;
+        if (group.size() <= 8) {
+            auto* search_node = new SearchInnerNode();
+            search_node->bulk_load(group);
+            return tagPointer(search_node, NodeType::SearchInner);
+        }
+        std::vector<KeyType> keys;
+        keys.reserve(group.size());
+        for (const auto& p : group) keys.push_back(p.first);
+        ConfigurationSearch cs(keys, lambda);
+        auto config = cs.search();
+        auto* model = new ModelInnerNode(config.best_slope, keys.front(), config.best_mr);
+        model->bulkLoad(group, config.best_slot_counts, lambda);
+        return tagPointer(model, NodeType::ModelInner);
+    };
+
+    for (size_t i = 0; i < slot_counts.size(); ++i) {
+        if (slot_counts[i] == 0) continue;
+
+        const size_t start = (i == 0) ? 0 : static_cast<size_t>(sums[i - 1]);
+        const size_t end = static_cast<size_t>(sums[i]);
+        const size_t group_n = end - start;
+        KeyType slot_key = leaves[start].first;
+        KeyType right_key = (group_n > 1) ? leaves[start + group_n / 2].first : slot_key;
+
+        std::vector<std::pair<KeyType, void*>> sliced_leaves(
+                std::make_move_iterator(leaves.begin() + static_cast<long>(start)),
+                std::make_move_iterator(leaves.begin() + static_cast<long>(end)));
+
+        // Paper §3.2: rebalance if one slot holds more than half the keys.
+        if (group_n > half && group_n > 1) {
+            size_t mid = group_n / 2;
+            std::vector<std::pair<KeyType, void*>> left(
+                std::make_move_iterator(sliced_leaves.begin()),
+                std::make_move_iterator(sliced_leaves.begin() + static_cast<long>(mid)));
+            std::vector<std::pair<KeyType, void*>> right(
+                std::make_move_iterator(sliced_leaves.begin() + static_cast<long>(mid)),
+                std::make_move_iterator(sliced_leaves.end()));
+            void* left_child = build_group(left);
+            void* right_child = build_group(right);
+            auto* bal = new SearchInnerNode();
+            std::vector<std::pair<KeyType, void*>> two = {
+                {slot_key, left_child},
+                {right_key, right_child}
+            };
+            bal->bulk_load(two);
+            bulkSetChild(slot_key, tagPointer(bal, NodeType::SearchInner));
             continue;
         }
 
-        // Determine the range of leaves for this slot
-        const size_t start = (i == 0) ? 0 : sums[i-1];
-        const size_t end = sums[i];
-        KeyType slot_key = leaves[start].first;
-
-        if (slot_counts[i] == 1) {
-            // Only one leaf assigned to this slot - direct mapping
-            bulkSetChild(slot_key, leaves[start].second);
-        } else if (slot_counts[i] <= 8) {
-            // Small number of leaves - use a search inner node
-            auto* search_node = new SearchInnerNode();
-
-            // Extract leaves for this slot
-            std::vector<std::pair<KeyType, void*>> sliced_leaves(
-                    std::make_move_iterator(leaves.begin() + start),
-                    std::make_move_iterator(leaves.begin() + end)
-            );
-
-            // Bulk load the search inner node
-            search_node->bulk_load(sliced_leaves);
-            void* taggedSearch = tagPointer(search_node, NodeType::SearchInner);
-            bulkSetChild(slot_key, taggedSearch);
+        if (group_n == 1) {
+            bulkSetChild(slot_key, sliced_leaves.front().second);
         } else {
-            // Large number of leaves - create another model inner node
-
-            // Extract keys for configuration search
-            std::vector<KeyType> keys;
-            keys.reserve(end - start);
-            std::transform(leaves.begin() + start, leaves.begin() + end,
-                           std::back_inserter(keys),
-                           [](const std::pair<KeyType, void*>& p) { return p.first; });
-
-            // Find optimal configuration for this subset
-            ConfigurationSearch cs(keys, lambda);
-            auto config = cs.search();
-
-            // Create new model inner node
-            auto* model_child_node = new ModelInnerNode(
-                    config.best_slope,
-                    keys.front(),
-                    config.best_mr
-            );
-
-            // Extract leaves for this model node
-            std::vector<std::pair<KeyType, void*>> sliced_leaves(
-                    std::make_move_iterator(leaves.begin() + start),
-                    std::make_move_iterator(leaves.begin() + end)
-            );
-
-            // Recursively insert into the new model node
-            model_child_node->bulkLoad(sliced_leaves, config.best_slot_counts, lambda);
-            void* taggedModel = tagPointer(model_child_node, NodeType::ModelInner);
-            bulkSetChild(slot_key, taggedModel);
+            bulkSetChild(slot_key, build_group(sliced_leaves));
         }
     }
 
-    initial_leaf_node_count_.store(leaf_node_count_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    initial_leaf_node_count_.store(leaf_node_count_.load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
+    fillLeadingDuplicates();
+}
+
+void ModelInnerNode::fillLeadingDuplicates() {
+    size_t first = slots_.size();
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        if (slots_[i].isRealChild()) { first = i; break; }
+    }
+    if (first == 0 || first >= slots_.size()) return;
+    void* child = slots_[first].KeyChildPtr.second;
+    for (size_t i = 0; i < first; ++i) {
+        if (!slots_[i].isRealChild()) slots_[i].setDuplicate(child);
+    }
 }
 
 void ModelInnerNode::bulkDuplicateToRight(size_t from) {
@@ -505,7 +487,7 @@ void* ModelInnerNode::getChildAtIndex(size_t idx) const {
     return child;
 }
 
-std::tuple<std::unique_lock<std::mutex>, void*, size_t> ModelInnerNode::findChildWithLock(KeyType key) {
+std::tuple<std::unique_lock<HyperSlotMutex>, void*, size_t> ModelInnerNode::findChildWithLock(KeyType key) {
     size_t idx = predictSlot(key);
 
     KeyType slotKey;
@@ -514,53 +496,36 @@ std::tuple<std::unique_lock<std::mutex>, void*, size_t> ModelInnerNode::findChil
 
     readSlotSeqLock(idx, slotKey, slotChild, isReal);
 
+    if (isReal && slotKey > key && idx > 0) {
+        idx--;
+        readSlotSeqLock(idx, slotKey, slotChild, isReal);
+    }
+
     size_t finalSlotIdx = idx;
-
-    if (isReal) {
-        // Check if we need to look at the previous slot
-        if (slotKey > key && idx > 0) {
-            idx--;
-            readSlotSeqLock(idx, slotKey, slotChild, isReal);
-            finalSlotIdx = idx;
-        }
-
-        if (isReal) {
-            // Found real child in current slot
-            std::unique_lock<std::mutex> lock(slots_[finalSlotIdx].lock);
-            return {std::move(lock), slotChild, finalSlotIdx};
-        } else {
-            // This is a duplicate slot - we need to find the real slot that owns this child
-            // Since duplicates now store direct pointers, we need to search for the real slot
-            void* targetChild = slotChild;
-            for (size_t i = 0; i < slots_.size(); i++) {
-                if (slots_[i].isRealChild() && slots_[i].KeyChildPtr.second == targetChild) {
-                    finalSlotIdx = i;
-                    break;
-                }
-            }
-        }
-    } else {
-        // This is a duplicate slot - we need to find the real slot that owns this child
+    if (!isReal) {
         void* targetChild = slotChild;
         for (size_t i = 0; i < slots_.size(); i++) {
             if (slots_[i].isRealChild() && slots_[i].KeyChildPtr.second == targetChild) {
                 finalSlotIdx = i;
-                slotChild = targetChild;
                 break;
             }
         }
     }
 
-    std::unique_lock<std::mutex> lock(slots_[finalSlotIdx].lock);
+    std::unique_lock<HyperSlotMutex> lock;
+    if (slot_locks_) {
+        lock = std::unique_lock<HyperSlotMutex>(slot_locks_[finalSlotIdx]);
+    }
     return {std::move(lock), slotChild, finalSlotIdx};
 }
 
 bool ModelInnerNode::areAllSlotsUnlocked() const {
-    for (const auto& slot : slots_) {
-        if (slot.lock.try_lock()) {
-            slot.lock.unlock();
+    if (!slot_locks_) return true;
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        if (slot_locks_[i].try_lock()) {
+            slot_locks_[i].unlock();
         } else {
-            return false;  // Slot is locked
+            return false;
         }
     }
     return true;
@@ -610,7 +575,36 @@ size_t ModelInnerNode::getLeafNodeCount() const {
 bool ModelInnerNode::shouldRebuild() const {
     size_t curr = leaf_node_count_.load(std::memory_order_relaxed);
     size_t init = initial_leaf_node_count_.load(std::memory_order_relaxed);
-    return init > 0 && curr >= 10 * init;
+    // Paper §3.3.2: rebuild M-inner when leaf count doubles.
+    return init > 0 && curr >= 2 * init;
+}
+
+std::vector<std::pair<KeyType, void*>> ModelInnerNode::collectSortedChildren() const {
+    std::vector<std::pair<KeyType, void*>> children;
+    children.reserve(slots_.size());
+    std::set<void*> seen;
+    for (const auto& slot : slots_) {
+        if (!slot.isRealChild()) continue;
+        void* child = slot.KeyChildPtr.second;
+        if (!child || !seen.insert(child).second) continue;
+        children.emplace_back(slot.KeyChildPtr.first, child);
+    }
+    std::sort(children.begin(), children.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    return children;
+}
+
+void ModelInnerNode::disownChildren() {
+    for (auto& slot : slots_) {
+        if (slot.isRealChild()) {
+            slot.KeyChildPtr.second = nullptr;
+            slot.KeyChildPtr.~pair();
+            slot.setDuplicate(nullptr);
+        } else {
+            slot.setDuplicate(nullptr);
+        }
+    }
+    leaf_node_count_.store(0, std::memory_order_relaxed);
 }
 
 void ModelInnerNode::deleteChildNode(void* childPtr) {

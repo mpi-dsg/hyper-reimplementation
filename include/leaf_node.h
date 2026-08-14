@@ -5,6 +5,8 @@
 #include "hyper_index.h"
 #include <cassert>
 #include <cmath>
+#include <cstdint>
+#include <memory>
 #include <vector>
 #include <optional>
 #include <mutex>
@@ -15,6 +17,11 @@
  * and 0 for pointers to overflow buffers
  */
 constexpr KeyType MSB_MASK = 1ULL << 63;
+
+/// Paper §6.1 / §3.3.1: Policy 1 conflict threshold \(C^{max}_{leaf}\).
+constexpr size_t kMaxLeafConflicts = 256;
+
+class LeafNode;
 
 /**
  * @enum InsertResult
@@ -33,10 +40,14 @@ enum class InsertResult {
 struct InsertReturn {
     InsertResult result;
     std::optional<std::vector<std::pair<KeyType, void*>>> splitDescriptors;
-    
+    /// When set, caller must invoke endSmo() after parent updates (§4.2.2).
+    LeafNode* smo_leaf = nullptr;
+
     InsertReturn(InsertResult res) : result(res) {}
-    InsertReturn(InsertResult res, std::vector<std::pair<KeyType, void*>>&& splits) 
+    InsertReturn(InsertResult res, std::vector<std::pair<KeyType, void*>>&& splits)
         : result(res), splitDescriptors(std::move(splits)) {}
+    InsertReturn(InsertResult res, std::vector<std::pair<KeyType, void*>>&& splits, LeafNode* leaf)
+        : result(res), splitDescriptors(std::move(splits)), smo_leaf(leaf) {}
 };
 
 /**
@@ -55,60 +66,24 @@ public:
      * or a pointer to an overflow buffer, with its own mutex for concurrency control.
      */
     struct Slot {
-        /**
-         * @union SlotData
-         * @brief Union to store either a key-value pair or a pointer to an overflow buffer.
-         */
-        union SlotData {
-            struct {
-                std::atomic<KeyType> key;     // Key with MSB set to 1
-                ValueType value; // Associated value
-            } kv;
-            std::atomic<OverflowBuffer*> overflowPtr; // Pointer to overflow buffer with MSB of 0
-        } data;
-
-        mutable std::mutex lock;  // Mutex for this specific slot
+        // Paper-like 16B cell: MSB of key marks KV; else overflow ptr / empty.
+        KeyType key = 0;
+        union {
+            ValueType value;
+            OverflowBuffer* overflowPtr;
+        };
 
         Slot();
         ~Slot();
 
-        /**
-         * @brief Destroys the slot content properly based on its type
-         */
         void destroy();
-
-        /**
-         * @brief Sets the slot to contain a single key-value pair
-         * @param k Key to store
-         * @param v Value to store
-         */
         void setSingle(KeyType k, ValueType v);
-
-        /**
-         * @brief Creates an overflow buffer and adds the key-value pair
-         * @param k Key to store
-         * @param v Value to store
-         */
         void setOverflow(KeyType k, ValueType v);
-
-        /**
-         * @brief Checks if the slot contains a key-value pair
-         * @return true if the slot contains a key-value pair, false otherwise
-         */
         bool isKV() const;
-
-        /**
-         * @brief Checks if the slot contains a pointer to an overflow buffer
-         * @return true if the slot contains a pointer, false otherwise
-         */
         bool isPointer() const;
-
-        /**
-         * @brief Checks if the slot is empty
-         * @return true if the slot is empty, false otherwise
-         */
         bool isEmpty() const;
     };
+    static_assert(sizeof(Slot) == 16, "Leaf slot must be 16 bytes");
 
     /**
      * @brief Constructs a leaf node with a linear model for key placement
@@ -157,8 +132,39 @@ public:
      * @brief Remove a key-value pair from the leaf node
      * @param key Key to erase
      * @return true if the key was found and removed, false otherwise
+     *
+     * Per Hyper §4.4: if @p key equals the leaf's leftmost key metadata
+     * (minKey_), the KV is removed but minKey_ is left unchanged to avoid
+     * frequent retraining.
      */
     bool erase(KeyType key);
+
+    /**
+     * @brief Number of live key-value pairs in this leaf (including overflows)
+     */
+    size_t size() const;
+
+    /**
+     * @brief Slot capacity of this leaf (MR_ + 1)
+     */
+    size_t capacity() const { return slots_.size(); }
+
+    /**
+     * @brief Fill ratio size()/capacity()
+     */
+    double density() const;
+
+    /**
+     * @brief If density falls below @p min_density, rebuild in place from
+     *        gatherAll() (Hyper §4.4 low-density rebuild).
+     * @return true if a rebuild ran
+     */
+    bool maybeRebuildLowDensity(double min_density);
+
+    /**
+     * @brief Structural heap/stack estimate for this leaf and its overflows.
+     */
+    size_t memoryBytes() const;
 
     /**
      * @brief Load multiple key-value pairs into the leaf node
@@ -171,6 +177,12 @@ public:
      * @return Vector of all key-value pairs
      */
     std::vector<std::pair<KeyType, ValueType>> gatherAll() const;
+
+    /**
+     * @brief Replace the value for an existing key (§4.4). Does not insert.
+     * @return true if the key was present and updated
+     */
+    bool update(KeyType key, ValueType value);
 
     /**
      * @brief Get the minimum key in the leaf node
@@ -215,9 +227,45 @@ public:
      * @brief Try to acquire all slot locks (for split operations)
      * @return vector of unique_locks if successful, empty vector if any lock fails
      */
-    std::vector<std::unique_lock<std::mutex>> tryLockAllSlots();
+    std::vector<std::unique_lock<HyperSlotMutex>> tryLockAllSlots();
+
+    /**
+     * @brief Policy 1 cheap retrain: rebuild leaf model in place when a single
+     *        PLA segment still fits; returns false if a split is required.
+     */
+    bool tryRetrainInPlace(double delta);
+
+    /**
+     * @brief Release the SMO lock held across split + parent reinsert (§4.2.2).
+     */
+    void endSmo();
 
 private:
+    using KvVec = std::vector<std::pair<KeyType, ValueType>>;
+    using PlaSeg = Hyper::PLASegment;
+
+    /**
+     * @brief Build PLA segments for sorted leaf data (shared by retrain/split).
+     */
+    static std::vector<PlaSeg> buildSegments(const KvVec& data, double delta);
+
+    /**
+     * @brief Rebuild this leaf's slots from @p data with a new linear model.
+     */
+    void rebuildInPlace(KvVec data, double slope, KeyType minKey, KeyType modelMaxKey);
+
+    /**
+     * @brief Expand slot capacity (~2×) and rebulk without PLA — ALEX-style
+     *        local SMO. Returns true if peak conflicts fall under threshold.
+     */
+    bool tryExpandInPlace(const KvVec& data);
+
+    /**
+     * @brief Single-segment PLA retrain using pre-gathered @p data.
+     *        On multi-segment failure, fills @p segs_out for reuse by split.
+     */
+    bool tryRetrainInPlace(const KvVec& data, double delta,
+                           std::vector<PlaSeg>* segs_out);
     /**
      * @brief Predicts the slot position for a given key using the linear model
      * @param key Key to predict slot for
@@ -235,6 +283,27 @@ private:
     bool checkPolicyTwo();
 
     /**
+     * @brief Max conflict count in any slot (Policy 1 histogram peak).
+     */
+    size_t maxConflictCount() const;
+
+    /**
+     * @brief Number of keys currently mapped to slot @p idx.
+     */
+    size_t slotConflictCount(size_t idx) const;
+
+    /**
+     * @brief Insert into an overflow buffer (in-place when unlocked, RCU otherwise).
+     */
+    void overflowInsert(Slot& slot, KeyType key, ValueType value);
+
+    /**
+     * @brief Erase from an overflow buffer (in-place when unlocked, RCU otherwise).
+     * @return true if the key was removed
+     */
+    bool overflowErase(Slot& slot, KeyType key);
+
+    /**
      * @brief Performs the actual split operation with all locks held
      * @param data All data from the leaf node
      * @param delta Error bound for PLA
@@ -244,14 +313,39 @@ private:
             const std::vector<std::pair<KeyType, ValueType>>& data,
             double delta);
 
+    /**
+     * @brief Split using precomputed PLA segments (avoids a second segmentation).
+     */
+    std::vector<std::pair<KeyType, void*>> performSplitWithSegments(
+            const KvVec& data, const std::vector<PlaSeg>& segments);
+
     double slope_;                   // Slope of the linear model
     size_t MR_;                      // Maximum range of slots
     KeyType minKey_;                 // Minimum key in the node
     KeyType maxPossibleKey_;         // Maximum possible key for this node
     std::vector<Slot> slots_;        // Array of slots for storing data
+    // Side array: only allocated when locking is enabled (ST has zero lock footprint).
+    std::unique_ptr<HyperSlotMutex[]> slot_locks_;
 
-    std::atomic<uint32_t> op_counter_;            // Counter for operations to trigger Policy Two
-    std::vector<int> init_histogram_; // Initial key distribution histogram
+    HyperSlotMutex& getSlotMutex(size_t idx) const {
+        return slot_locks_[idx];
+    }
+    bool hasSlotLocks() const { return static_cast<bool>(slot_locks_); }
+
+    // Policy 2 trigger: ST uses a plain 16-bit counter; MT packs into a word.
+    static constexpr unsigned kOpCounterShift = 48;
+    std::atomic<uintptr_t> op_counter_ptr_{0};
+    uint16_t op_counter_st_{0};
+    // Initial histogram for Policy 2 (allocated at bulkLoad / retrain only).
+    std::unique_ptr<uint16_t[]> init_histogram_;
+    size_t init_histogram_len_{0};
+
+    // Held from leaf split gather through parent descriptor install (MT).
+    std::mutex smo_lock_;
+    bool smo_held_ = false;
+
+    bool bumpOpCounterWrapped();
+    void ensureInitHistogram(size_t n);
 };
 
 #endif // HYPERCODE_LEAF_NODE_H

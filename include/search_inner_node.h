@@ -16,19 +16,20 @@
  */
 class SearchInnerNode {
 public:
-    mutable std::mutex  structural_lock_;               ///< Lock for structural changes
+    mutable HyperSlotMutex structural_lock_;            ///< Allocated only when locking enabled
     struct ChildEntry {
         KeyType boundaryKey;
         void* childPtr;
         mutable std::unique_ptr<std::mutex> lock;
 
         ChildEntry(KeyType key, void* ptr)
-                : boundaryKey(key), childPtr(ptr), lock(std::make_unique<std::mutex>()) {}
+                : boundaryKey(key), childPtr(ptr),
+                  lock(isHyperLockingEnabled() ? std::make_unique<std::mutex>() : nullptr) {}
 
         // Copy constructor for RCU updates
         ChildEntry(const ChildEntry& other)
                 : boundaryKey(other.boundaryKey), childPtr(other.childPtr),
-                  lock(std::make_unique<std::mutex>()) {}
+                  lock(isHyperLockingEnabled() ? std::make_unique<std::mutex>() : nullptr) {}
 
         // Move constructor
         ChildEntry(ChildEntry&& other) noexcept
@@ -62,6 +63,12 @@ public:
      * @param child Pointer to the child node
      */
     void addChild(KeyType boundaryKey, void* child);
+
+    /**
+     * @brief Replace a child pointer in-place (keeps boundary key), or insert if missing.
+     * @return true if an existing entry was replaced
+     */
+    bool replaceChildPtr(void* oldChild, KeyType boundaryKey, void* newChild);
 
     /**
      * @brief Finds the child node responsible for the given key
@@ -110,6 +117,11 @@ public:
      * @return Pair of {lock_pointer, child_pointer}, both nullptr if invalid index
      */
     std::pair<std::mutex*, void*> getSlotLockAndChild(int idx);
+
+    /**
+     * @brief Null out child pointers so the destructor does not free the subtree.
+     */
+    void disownChildren();
 
     /**
      * @brief Gets the version counter for consistent reads
